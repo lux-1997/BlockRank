@@ -1,0 +1,80 @@
+# Evaluation config covering all BEIR-style datasets shipped in data/icr-beir-evals.
+# By default, eval_attn.py will use the `data` + `eval` sections below (currently trec_covid).
+# The `datasets` list is provided for convenience so you can comment out the ones you
+# don't want and loop over them in a small script (see usage notes).
+
+model:
+  model_name_or_path: "/code/in_context_retrieval/BlockRank/outputs/full-blockrank-qwen-4b-ins-first-sequential"
+  # 原始设置：
+  # attn_implementation: "eager_blockrank"  
+  # use_blockrank: false
+  attn_implementation: "default_blockrank"   # 或 sdpa_blockrank / eager_blockrank
+  
+  block_order: "instruction_first"           # instruction_first | doc_first
+  doc_cross_attn: false                     # true=doc 互相可见(仅前序docs)，false=doc仅self
+
+# Default dataset for a single eval run (you can change these manually).
+data:
+  data_path: "data/icr-beir-evals/bm25-top100/trec_covid.jsonl"
+  qrels_path: "/code/.cache/pyserini/topics-and-qrels/qrels.beir-v1.0.0-trec-covid.test.txt"
+  position_id_mode: "perm_invariant" # perm_invariant | sequential
+  query_in_instruction: true
+
+eval:
+  num_documents: 100
+  output_dir: "outputs/eval_beir_trec_covid"
+  seed: 42
+  per_device_eval_batch_size: 2
+  train_test_split: 1.0
+  max_block_length: 384
+  aux_layer_idx: 20
+  token_compression_mode: "topk"  # none | topk | last
+  token_compression_topk: 10   # 仅在 token_compression_mode=topk 时生效
+
+# Full list of BEIR datasets available locally.
+# Comment out any entries you don't want to include in a multi-run loop.
+datasets:
+  - name: trec_covid
+    data_path: "data/icr-beir-evals/bm25-top100/trec_covid.jsonl"
+    qrels_path: "/code/.cache/pyserini/topics-and-qrels/qrels.beir-v1.0.0-trec-covid.test.txt"
+    output_dir: "outputs/eval_beir_trec_covid"
+  # - name: nq
+  #   data_path: "data/icr-beir-evals/bm25-top100/nq.jsonl"
+  #   qrels_path: "/code/.cache/pyserini/topics-and-qrels/qrels.beir-v1.0.0-nq.test.txt"
+  #   output_dir: "outputs/eval_beir_nq"
+  # - name: hotpotqa
+  #   data_path: "data/icr-beir-evals/bm25-top100/hotpotqa.jsonl"
+  #   qrels_path: "/code/.cache/pyserini/topics-and-qrels/qrels.beir-v1.0.0-hotpotqa.test.txt"
+  #   output_dir: "outputs/eval_beir_hotpotqa"
+  - name: dbpedia_entity
+    data_path: "data/icr-beir-evals/bm25-top100/dbpedia_entity.jsonl"
+    qrels_path: "/code/.cache/pyserini/topics-and-qrels/qrels.beir-v1.0.0-dbpedia-entity.test.txt"
+    output_dir: "outputs/eval_beir_dbpedia_entity"
+  - name: scifact
+    data_path: "data/icr-beir-evals/bm25-top100/scifact.jsonl"
+    qrels_path: "/code/.cache/pyserini/topics-and-qrels/qrels.beir-v1.0.0-scifact.test.txt"
+    output_dir: "outputs/eval_beir_scifact"
+  - name: scidocs
+    data_path: "data/icr-beir-evals/bm25-top100/scidocs.jsonl"
+    qrels_path: "/code/.cache/pyserini/topics-and-qrels/qrels.beir-v1.0.0-scidocs.test.txt"
+    output_dir: "outputs/eval_beir_scidocs"
+  - name: fiqa
+    data_path: "data/icr-beir-evals/bm25-top100/fiqa.jsonl"
+    qrels_path: "/code/.cache/pyserini/topics-and-qrels/qrels.beir-v1.0.0-fiqa.test.txt"
+    output_dir: "outputs/eval_beir_fiqa"
+  - name: nfcorpus
+    data_path: "data/icr-beir-evals/bm25-top100/nfcorpus.jsonl"
+    qrels_path: "/code/.cache/pyserini/topics-and-qrels/qrels.beir-v1.0.0-nfcorpus.test.txt"
+    output_dir: "outputs/eval_beir_nfcorpus"
+  # - name: fever
+  #   data_path: "data/icr-beir-evals/bm25-top100/fever.jsonl"
+  #   qrels_path: "/code/.cache/pyserini/topics-and-qrels/qrels.beir-v1.0.0-fever.test.txt"
+  #   output_dir: "outputs/eval_beir_fever"
+  - name: climate_fever
+    data_path: "data/icr-beir-evals/bm25-top100/climate_fever.jsonl"
+    qrels_path: "/code/.cache/pyserini/topics-and-qrels/qrels.beir-v1.0.0-climate-fever.test.txt"
+    output_dir: "outputs/eval_beir_climate_fever"
+  # - name: msmarco
+  #   data_path: "data/icr-beir-evals/bm25-top100/msmarco.jsonl"
+  #   qrels_path: "/code/.cache/pyserini/topics-and-qrels/qrels.beir-v1.0.0-msmarco.test.txt"
+  #   output_dir: "outputs/eval_beir_msmarco"
