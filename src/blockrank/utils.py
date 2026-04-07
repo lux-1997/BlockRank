@@ -88,6 +88,8 @@ def format_ranking_prompt_mistral(
     sep: str,
     block_order: str = "instruction_first",
     query_in_instruction: bool = True,
+    doc_end_token: str | None = None,
+    remove_doc_id: bool = False,
 ) -> str:
     """
     Format query and documents into a prompt for document ranking.
@@ -101,7 +103,18 @@ def format_ranking_prompt_mistral(
         Formatted prompt string (default). If include_answer=True and answer_ids provided, returns tuple (prompt/segments, answer_ids/completion)
     """
     # Build the prompt
-    instruction = '''You will be given a query and a list of documents. Each document will be formatted as ID: <id> | CONTENT: <content> | END ID: <id>. You need to read carefully and understand all of them and your goal is to find all document(s) from the list that can help answer the query.'''
+    if remove_doc_id:
+        instruction = (
+            "You will be given a query and a list of documents. Each document will be formatted as "
+            "CONTENT: <content> | END. Documents are ordered as listed, and you should use 0-based indices "
+            "for answers."
+        )
+    else:
+        instruction = (
+            "You will be given a query and a list of documents. Each document will be formatted as "
+            "ID: <id> | CONTENT: <content> | END ID: <id>. You need to read carefully and understand "
+            "all of them and your goal is to find all document(s) from the list that can help answer the query."
+        )
 
     doc_intro = "Documents are listed above." if block_order == "doc_first" else "Documents:"
     if query_in_instruction:
@@ -109,7 +122,11 @@ def format_ranking_prompt_mistral(
     else:
         prompt_parts = [f"{instruction}\n\n{doc_intro}"]
 
-    format_doc = lambda id, text: f"ID: {id} | CONTENT: {text} | END ID: {id}"
+    end_suffix = f" {doc_end_token}" if doc_end_token else ""
+    if remove_doc_id:
+        format_doc = lambda _id, text: f"CONTENT: {text} | END{end_suffix}"
+    else:
+        format_doc = lambda _id, text: f"ID: {_id} | CONTENT: {text} | END ID: {_id}{end_suffix}"
 
     # Add documents in order
     doc_ids = range(len(documents))
@@ -119,9 +136,14 @@ def format_ranking_prompt_mistral(
         doc_blocks.append(formatted_doc)
 
     # Final query section
+    answer_instruction = (
+        "Find the most relevant document position.\n"
+        if remove_doc_id
+        else "Which document is most relevant to answer the query? Print out the ID of the document.\n"
+    )
     final_section = (
-        '\n====== Now let\'s start! ======\n'
-        "Which document is most relevant to answer the query? Print out the ID of the document.\n"
+        "\n====== Now let's start! ======\n"
+        f"{answer_instruction}"
         f"Query: {query}\n"
         "The following document(s) can help answer the query:"
     )
@@ -144,9 +166,23 @@ def format_ranking_prompt_qwen(
     sep: str,
     block_order: str = "instruction_first",
     query_in_instruction: bool = True,
+    doc_end_token: str | None = None,
+    remove_doc_id: bool = False,
 ) -> str:
     # Build the prompt
-    instruction = "You will be given a query and a list of documents. Each document will be formatted as <Document>: ID: <id> | CONTENT: <content> | END ID: <id>. You need to read and understand carefully the content of each document and your goal is to give the IDs of the document from the list that can help answer the query."
+    if remove_doc_id:
+        instruction = (
+            "You will be given a query and a list of documents. Each document will be formatted as "
+            "<Document>: CONTENT: <content> | END. Documents are ordered as listed, and you should use "
+            "0-based indices for answers."
+        )
+    else:
+        instruction = (
+            "You will be given a query and a list of documents. Each document will be formatted as "
+            "<Document>: ID: <id> | CONTENT: <content> | END ID: <id>. You need to read and understand "
+            "carefully the content of each document and your goal is to give the IDs of the document from "
+            "the list that can help answer the query."
+        )
     doc_intro = "Documents are listed above." if block_order == "doc_first" else ""
     if block_order != "doc_first":
         if query_in_instruction:
@@ -155,7 +191,11 @@ def format_ranking_prompt_qwen(
             prompt_parts = [f"<Instruct>: {instruction}\n{doc_intro}\n"]
     else:
         prompt_parts = []
-    format_doc = lambda id, text: f"<Document>: ID: {id} | CONTENT: {text} | END ID: {id}"
+    end_suffix = f" {doc_end_token}" if doc_end_token else ""
+    if remove_doc_id:
+        format_doc = lambda _id, text: f"<Document>: CONTENT: {text} | END{end_suffix}"
+    else:
+        format_doc = lambda _id, text: f"<Document>: ID: {_id} | CONTENT: {text} | END ID: {_id}{end_suffix}"
 
     # Add documents in order
     doc_ids = range(len(documents))
@@ -164,9 +204,14 @@ def format_ranking_prompt_qwen(
         formatted_doc = format_doc(doc_id, documents[doc_id].strip())
         doc_blocks.append(formatted_doc)
 
+    answer_instruction = (
+        "Find the most relevant document position.\n"
+        if remove_doc_id
+        else "Which document is most relevant to answer the query? Print out the ID of the document.\n"
+    )
     final_section = (
         "\n====== Now let's start! ======\n"
-        "Which document is most relevant to answer the query? Print out the ID of the document.\n"
+        f"{answer_instruction}"
         f"<Query>: {query}\n"
         "The following document(s) can help answer the query:"
     )
@@ -193,9 +238,22 @@ def create_conversation_format_mistral(
     sep="\n",
     block_order: str = "instruction_first",
     query_in_instruction: bool = True,
+    doc_end_token: str | None = None,
+    remove_doc_id: bool = False,
 ) -> List[Dict[str, str]]:
     return [
-        {"role": "user", "content": format_ranking_prompt_mistral(query, documents, sep, block_order, query_in_instruction)},
+        {
+            "role": "user",
+            "content": format_ranking_prompt_mistral(
+                query,
+                documents,
+                sep,
+                block_order,
+                query_in_instruction,
+                doc_end_token=doc_end_token,
+                remove_doc_id=remove_doc_id,
+            ),
+        },
         {"role": "assistant", "content": f"Final Answer: {sep}[" + (', '.join([str(x) for x in answer_ids]) + f"]" if answer_ids else "")}
     ]
 
@@ -206,11 +264,24 @@ def create_conversation_format_qwen(
     sep="\n",
     block_order: str = "instruction_first",
     query_in_instruction: bool = True,
+    doc_end_token: str | None = None,
+    remove_doc_id: bool = False,
 ) -> List[Dict[str, str]]:
     #2026.01.13修改，恢复qwen的assistant content构造，
     return [
         # {"role": "system", "content": "Judge whether the Document meets the requirements based on the Query and the Instruct provided."},
-        {"role": "user", "content": format_ranking_prompt_qwen(query, documents, sep, block_order, query_in_instruction)},
+        {
+            "role": "user",
+            "content": format_ranking_prompt_qwen(
+                query,
+                documents,
+                sep,
+                block_order,
+                query_in_instruction,
+                doc_end_token=doc_end_token,
+                remove_doc_id=remove_doc_id,
+            ),
+        },
         {"role": "assistant", "content": f"<think>\n</think>\n<Answer>: {sep}[" + (', '.join([str(x) for x in answer_ids]) + f"]" if answer_ids else "")}
     ]
     # if answer_ids:
@@ -231,12 +302,32 @@ def create_prompt_completion_format(
     type: str = "mistral", # mistral or qwen
     block_order: str = "instruction_first",
     query_in_instruction: bool = True,
+    doc_end_token: str | None = None,
+    remove_doc_id: bool = False,
 ) -> Dict[str, str]:
     if type == "mistral":
-        m = create_conversation_format_mistral(query, documents, answer_ids, sep, block_order, query_in_instruction)
+        m = create_conversation_format_mistral(
+            query,
+            documents,
+            answer_ids,
+            sep,
+            block_order,
+            query_in_instruction,
+            doc_end_token=doc_end_token,
+            remove_doc_id=remove_doc_id,
+        )
         return {"prompt": m[:1], "completion": m[1:]}
     elif type == "qwen":
-        m = create_conversation_format_qwen(query, documents, answer_ids, sep, block_order, query_in_instruction)
+        m = create_conversation_format_qwen(
+            query,
+            documents,
+            answer_ids,
+            sep,
+            block_order,
+            query_in_instruction,
+            doc_end_token=doc_end_token,
+            remove_doc_id=remove_doc_id,
+        )
         # Keep the final assistant message as completion even when no system message is present.
         return {"prompt": m[:-1], "completion": m[-1:]}
     else:

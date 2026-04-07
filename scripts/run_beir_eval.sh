@@ -6,10 +6,15 @@ set -euo pipefail
 # - config_yaml: YAML with a top-level `datasets` list (defaults to configs/eval_mistral_beir.yaml)
 # - checkpoint_path: model checkpoint to load (defaults to the cached BlockRank checkpoint)
 # - dataset_name: optional whitespace-separated list to limit which datasets to run (or comment them out in YAML)
+#
+# Multi-GPU:
+# - Use CUDA_VISIBLE_DEVICES to choose GPUs (e.g., CUDA_VISIBLE_DEVICES=4,5,6,7 ...)
+# - Optional override: EVAL_NPROC_PER_NODE=4
+# - Optional port: EVAL_MASTER_PORT=29547
 
 CONFIG=${1:-configs/eval_mistral_beir.yaml}
 if [ $# -gt 0 ]; then shift; fi
-CKPT=${1:-/code/in_context_retrieval/BlockRank/outputs/blockrank-10p-msmarco-mistral-7b-only-copynet}
+CKPT=${1:-/data/mengrui/test_lx/OLM2Vec/BlockRank/outputs/blockrank-10p-msmarco-mistral-7b-only-copynet-no-prefix-query-last-32-token}
 if [ $# -gt 0 ]; then shift; fi
 
 # Disable W&B network/login; override by exporting WANDB_DISABLED=false or WANDB_MODE=online if you really want logging.
@@ -61,12 +66,39 @@ for ds in datasets:
         yaml.safe_dump(run_cfg, tmp, sort_keys=False)
 
     print(f"\n=== Running {name} ===")
-    # Use attention-based evaluation (BlockRank attention scores).
-    cmd = ["python", "scripts/eval_attn.py", "--config", tmp_path, "--checkpoint", ckpt_path]
     env = os.environ.copy()
     env.setdefault("WANDB_DISABLED", "true")
     env.setdefault("WANDB_MODE", "offline")
     env.setdefault("WANDB_API_KEY", "offline")
+
+    # Multi-GPU support:
+    # - If EVAL_NPROC_PER_NODE is set, use it.
+    # - Else infer process count from CUDA_VISIBLE_DEVICES.
+    nproc_env = env.get("EVAL_NPROC_PER_NODE", "").strip()
+    if nproc_env:
+        nproc = int(nproc_env)
+    else:
+        cuda_visible = env.get("CUDA_VISIBLE_DEVICES", "").strip()
+        if cuda_visible and cuda_visible not in {"-1", "none", "None"}:
+            nproc = len([x for x in cuda_visible.split(",") if x.strip()])
+        else:
+            nproc = 1
+    nproc = max(1, nproc)
+
+    if nproc > 1:
+        master_port = env.get("EVAL_MASTER_PORT", env.get("MASTER_PORT", "29547"))
+        cmd = [
+            "torchrun",
+            "--nproc_per_node", str(nproc),
+            "--master_port", str(master_port),
+            "scripts/eval_attn.py",
+            "--config", tmp_path,
+            "--checkpoint", ckpt_path,
+        ]
+    else:
+        cmd = ["python", "scripts/eval_attn.py", "--config", tmp_path, "--checkpoint", ckpt_path]
+
+    print("Launcher:", " ".join(cmd))
     subprocess.run(cmd, check=True, env=env)
 
     os.remove(tmp_path)

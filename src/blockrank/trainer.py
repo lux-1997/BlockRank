@@ -8,7 +8,11 @@ language modeling loss with an auxiliary contrastive loss on attention patterns.
 import os
 import torch
 from trl import SFTTrainer
-from .losses import compute_auxiliary_attention_loss, compute_auxiliary_attention_loss_copynet
+from .losses import (
+    compute_auxiliary_attention_loss,
+    compute_auxiliary_attention_loss_copynet,
+    compute_doc_last_token_alignment_loss
+)
 from peft import PeftType
 
 
@@ -71,17 +75,65 @@ class BlockRankAuxLossTrainer(SFTTrainer):
             assert 'answer_ids' in inputs, "Input batch must contain 'answer_ids' for auxiliary loss."
             # Forward pass with attention outputs for the specified layer
             aux_layer_idx = self.args.aux_layer_idx
+            token_compression_mode = getattr(self.args, "token_compression_mode", "none").lower()
+            token_compression_last_k = int(getattr(self.args, "token_compression_last_k", 1))
+            attention_weighted_top_k = getattr(self.args, "attention_weighted_top_k", 1)
+            if isinstance(attention_weighted_top_k, str) and attention_weighted_top_k.strip().lower() in ("none", "null", ""):
+                attention_weighted_top_k = None
+            elif attention_weighted_top_k is not None:
+                attention_weighted_top_k = int(attention_weighted_top_k)
+            query_aggregation_mode = getattr(self.args, "query_aggregation_mode", "single").lower()
+            block_order = getattr(self.model.config, "blockrank_block_order", "instruction_first")
+            if token_compression_mode not in ("none", "last", "mid_last", "topk"):
+                raise ValueError(f"Unknown token_compression_mode: {token_compression_mode}")
+            if token_compression_last_k <= 0:
+                raise ValueError(
+                    f"token_compression_last_k must be > 0, got: {token_compression_last_k}"
+                )
+            if attention_weighted_top_k is not None and attention_weighted_top_k <= 0:
+                raise ValueError(
+                    f"attention_weighted_top_k must be > 0 when provided, got: {attention_weighted_top_k}"
+                )
+            if query_aggregation_mode not in ("single", "mean_all", "logsumexp_all"):
+                raise ValueError(
+                    f"Unknown query_aggregation_mode: {query_aggregation_mode}. "
+                    "Expected one of ['single', 'mean_all', 'logsumexp_all']."
+                )
+
+            use_doc_align_loss = bool(getattr(self.args, "use_doc_align_loss", False))
+            doc_align_loss_weight = float(getattr(self.args, "doc_align_loss_weight", 0.0))
+            compute_doc_align = (
+                use_doc_align_loss and doc_align_loss_weight > 0.0 and token_compression_mode in ("last", "mid_last")
+            )
 
             # Prepare model inputs (exclude non-model keys)
             model_input_keys = {'input_ids', 'attention_mask', 'position_ids', 'labels'}
-            model_inputs = {k: v for k, v in inputs.items() if k in model_input_keys}
+            full_model_inputs = {k: v for k, v in inputs.items() if k in model_input_keys}
+            student_model_inputs = dict(full_model_inputs)
+
+            teacher_hidden = None
+            if compute_doc_align:
+                teacher_model_inputs = {k: v for k, v in full_model_inputs.items() if k != 'labels'}
+                with torch.no_grad():
+                    teacher_outputs = model(
+                        **teacher_model_inputs,
+                        output_hidden_states=True,
+                        output_attentions=False,
+                    )
+                assert teacher_outputs.hidden_states is not None and len(teacher_outputs.hidden_states) > 0
+                teacher_hidden = teacher_outputs.hidden_states[-1].detach()
 
             # Forward pass requesting attention scores from specific layer
+            num_last_queries = int(getattr(self.args, "aux_num_last_queries", 32))
             outputs = model(
-                **model_inputs,
+                **student_model_inputs,
                 output_attentions=True,
+                output_hidden_states=compute_doc_align,
                 layers_to_return_scores=[aux_layer_idx],
-                num_last_queries=32,
+                num_last_queries=num_last_queries,
+                token_compression_mode=token_compression_mode,
+                token_compression_last_k=token_compression_last_k,
+                attention_weighted_top_k=attention_weighted_top_k,
             )
 
             assert outputs.attentions is not None, "Model did not return attention scores."
@@ -110,7 +162,7 @@ class BlockRankAuxLossTrainer(SFTTrainer):
                 print(
                     "[BlockRankAuxDebug] block_order="
                     f"{getattr(self.model.config, 'blockrank_block_order', 'instruction_first')} "
-                    f"aux_layer_idx={aux_layer_idx} num_last_queries=32"
+                    f"aux_layer_idx={aux_layer_idx} num_last_queries={num_last_queries}"
                 )
 
             # Get standard LM loss from model outputs
@@ -128,15 +180,34 @@ class BlockRankAuxLossTrainer(SFTTrainer):
                 attention_scores=outputs.attentions[0],  # (B, N, 16, M*H)
                 labels=inputs['labels'],  # (B, M*H)
                 answer_ids=inputs['answer_ids'],  # (B, max_num_answers)
-                attention_mask=inputs['attention_mask'],  # (B, M, H)
+                attention_mask=student_model_inputs['attention_mask'],  # (B, M, H)
                 temperature=self.args.aux_temperature,
-                block_order=getattr(self.model.config, "blockrank_block_order", "instruction_first"),
+                query_token_offset=getattr(self.args, "aux_query_token_offset", 0),
+                block_order=block_order,
                 aux_norm_mode=getattr(self.args, "aux_norm_mode", "doc_plus_non_doc"),
+                token_compression_mode=token_compression_mode,
+                token_compression_last_k=token_compression_last_k,
+                attention_weighted_top_k=attention_weighted_top_k,
+                query_aggregation_mode=query_aggregation_mode,
+                query_token_mask=inputs.get("query_token_mask", None),
             )
 
             # Combine losses with configured weight
             aux_weight = self.args.aux_loss_weight
             total_loss = sft_weight * lm_loss + aux_weight * aux_loss
+
+            doc_align_loss = None
+            if compute_doc_align:
+                assert outputs.hidden_states is not None and len(outputs.hidden_states) > 0
+                assert teacher_hidden is not None
+                doc_align_loss = compute_doc_last_token_alignment_loss(
+                    student_hidden=outputs.hidden_states[-1],
+                    teacher_hidden=teacher_hidden,
+                    full_attention_mask=full_model_inputs['attention_mask'],
+                    student_attention_mask=student_model_inputs['attention_mask'],
+                    block_order=block_order,
+                )
+                total_loss = total_loss + doc_align_loss_weight * doc_align_loss
 
             # Log individual loss components (every logging_steps)
             self._metrics[mode]["lm_loss"].append(self.accelerator.gather_for_metrics(lm_loss).mean().item())
@@ -144,6 +215,9 @@ class BlockRankAuxLossTrainer(SFTTrainer):
             self._metrics[mode]["aux_loss"].append(self.accelerator.gather_for_metrics(aux_loss).mean().item())
             if aux_loss_type == "copynet":
                 self._metrics[mode]["copynet_loss"].append(self.accelerator.gather_for_metrics(aux_loss).mean().item())
+            if doc_align_loss is not None:
+                self._metrics[mode]["doc_align_loss"].append(self.accelerator.gather_for_metrics(doc_align_loss).mean().item())
+                self._metrics[mode]["doc_align_loss_weight"].append(doc_align_loss_weight)
             self._metrics[mode]["total_loss"].append(self.accelerator.gather_for_metrics(total_loss).mean().item())
             self._metrics[mode]["aux_attn_accuracy"].append(self.accelerator.gather_for_metrics(attn_acc).mean().item())
         else:

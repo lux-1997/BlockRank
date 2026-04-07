@@ -75,6 +75,9 @@ class DataArgs:
     qrels_path: Optional[str] = None
     position_id_mode: str = "perm_invariant"  # perm_invariant or sequential
     query_in_instruction: bool = True
+    remove_doc_id: bool = False  # when true, format documents without explicit "ID: ... | END ID: ..."
+    doc_end_token: Optional[str] = None  # e.g., "<eos>" to append tokenizer.eos_token after each document
+    preserve_doc_last_token: bool = False  # keep per-document last token when block truncation happens
 
 @dataclass
 class TrainArgs(SFTConfig):
@@ -117,9 +120,16 @@ class TrainArgs(SFTConfig):
     aux_temperature: float = 0.1
     aux_loss_type: str = "infonce"
     aux_norm_mode: str = "doc_plus_non_doc"
+    aux_query_token_offset: int = 0
+    aux_num_last_queries: int = 32  # number of last query positions returned by attention kernel
     sft_loss_weight: float = 1.0
-    token_compression_mode: str = "none"  # none | topk | last (used by eval_attn.py)
+    token_compression_mode: str = "none"  # none | topk | last | mid_last (used by eval_attn.py)
     token_compression_topk: int = 8       # only used when token_compression_mode=topk
+    token_compression_last_k: int = 1     # only used when token_compression_mode=last
+    attention_weighted_top_k: Optional[int] = 1  # None => last-k only; k => last-k + attention-weighted top-k
+    query_aggregation_mode: str = "single"  # single | mean_all | logsumexp_all
+    use_doc_align_loss: bool = False      # align compressed doc representation to full-doc representation
+    doc_align_loss_weight: float = 0.1    # weight for doc alignment loss
 
 def load_config(path: Optional[str]) -> Dict[str, Any]:
     if not path or not os.path.exists(path):
@@ -196,6 +206,8 @@ def load_datasets(d: DataArgs, tokenizer, use_blockrank: bool = False, block_ord
         'eval_mode': False,
         'block_order': block_order,
         'query_in_instruction': d.query_in_instruction,
+        'remove_doc_id': d.remove_doc_id,
+        'doc_end_token': d.doc_end_token,
     }
     if d.val_data_path:
         # Build separate train and val from two files
@@ -260,6 +272,7 @@ def main():
             max_block_length=dargs.max_block_length,
             position_id_mode=dargs.position_id_mode,
             block_order=margs.block_order,
+            preserve_doc_last_token=dargs.preserve_doc_last_token,
         )
         logger.info(f"Using BlockRank collate function with max_block_length={dargs.max_block_length}")
     else:
@@ -273,7 +286,14 @@ def main():
         logger.info(
             f"Using BlockRankAuxLossTrainer with aux_layer_idx={targs.aux_layer_idx}, "
             f"aux_loss_weight={targs.aux_loss_weight}, aux_temperature={targs.aux_temperature}, "
-            f"aux_loss_type={targs.aux_loss_type}"
+            f"aux_loss_type={targs.aux_loss_type}, aux_query_token_offset={targs.aux_query_token_offset}, "
+            f"aux_num_last_queries={getattr(targs, 'aux_num_last_queries', 32)}, "
+            f"token_compression_mode={targs.token_compression_mode}, "
+            f"token_compression_last_k={getattr(targs, 'token_compression_last_k', 1)}, "
+            f"attention_weighted_top_k={getattr(targs, 'attention_weighted_top_k', 1)}, "
+            f"query_aggregation_mode={getattr(targs, 'query_aggregation_mode', 'single')}, "
+            f"use_doc_align_loss={getattr(targs, 'use_doc_align_loss', False)}, "
+            f"doc_align_loss_weight={getattr(targs, 'doc_align_loss_weight', 0.0)}"
         )
 
     trainer = TrainerClass(

@@ -16,9 +16,10 @@ model:
 # Default dataset for a single eval run (you can change these manually).
 data:
   data_path: "data/icr-beir-evals/bm25-top100/trec_covid.jsonl"
-  qrels_path: "/code/.cache/pyserini/topics-and-qrels/qrels.beir-v1.0.0-trec-covid.test.txt"
+  qrels_path: "data/icr-beir-evals/qrels/trec_covid.tsv"
   position_id_mode: "perm_invariant" # perm_invariant | sequential
-  query_in_instruction: true
+  query_in_instruction: false
+  remove_doc_id: true  # true => remove explicit 'ID: ... | END ID: ...' wrappers from doc blocks
 
 eval:
   num_documents: 100
@@ -28,15 +29,17 @@ eval:
   train_test_split: 1.0
   max_block_length: 384
   aux_layer_idx: 20
-  token_compression_mode: "topk"  # none | topk | last
-  token_compression_topk: 10   # 仅在 token_compression_mode=topk 时生效
+  token_compression_mode: "last"  # none | topk | last
+  token_compression_last_k: 32     # only used when token_compression_mode=last
+  attention_weighted_top_k: none     # null/none => last-k only; k => last-k + doc-last-token attention top-k
+  token_compression_topk: 1   # 仅在 token_compression_mode=topk 时生效
 
 # Full list of BEIR datasets available locally.
 # Comment out any entries you don't want to include in a multi-run loop.
 datasets:
   - name: trec_covid
     data_path: "data/icr-beir-evals/bm25-top100/trec_covid.jsonl"
-    qrels_path: "/code/.cache/pyserini/topics-and-qrels/qrels.beir-v1.0.0-trec-covid.test.txt"
+    qrels_path: "data/icr-beir-evals/qrels/trec_covid.tsv"
     output_dir: "outputs/eval_beir_trec_covid"
   # - name: nq
   #   data_path: "data/icr-beir-evals/bm25-top100/nq.jsonl"
@@ -48,23 +51,23 @@ datasets:
   #   output_dir: "outputs/eval_beir_hotpotqa"
   - name: dbpedia_entity
     data_path: "data/icr-beir-evals/bm25-top100/dbpedia_entity.jsonl"
-    qrels_path: "/code/.cache/pyserini/topics-and-qrels/qrels.beir-v1.0.0-dbpedia-entity.test.txt"
+    qrels_path: "data/icr-beir-evals/qrels/dbpedia_entity.tsv"
     output_dir: "outputs/eval_beir_dbpedia_entity"
   - name: scifact
     data_path: "data/icr-beir-evals/bm25-top100/scifact.jsonl"
-    qrels_path: "/code/.cache/pyserini/topics-and-qrels/qrels.beir-v1.0.0-scifact.test.txt"
+    qrels_path: "data/icr-beir-evals/qrels/scifact.tsv"
     output_dir: "outputs/eval_beir_scifact"
   - name: scidocs
     data_path: "data/icr-beir-evals/bm25-top100/scidocs.jsonl"
-    qrels_path: "/code/.cache/pyserini/topics-and-qrels/qrels.beir-v1.0.0-scidocs.test.txt"
+    qrels_path: "data/icr-beir-evals/qrels/scidocs.tsv"
     output_dir: "outputs/eval_beir_scidocs"
   - name: fiqa
     data_path: "data/icr-beir-evals/bm25-top100/fiqa.jsonl"
-    qrels_path: "/code/.cache/pyserini/topics-and-qrels/qrels.beir-v1.0.0-fiqa.test.txt"
+    qrels_path: "data/icr-beir-evals/qrels/fiqa.tsv"
     output_dir: "outputs/eval_beir_fiqa"
   - name: nfcorpus
     data_path: "data/icr-beir-evals/bm25-top100/nfcorpus.jsonl"
-    qrels_path: "/code/.cache/pyserini/topics-and-qrels/qrels.beir-v1.0.0-nfcorpus.test.txt"
+    qrels_path: "data/icr-beir-evals/qrels/nfcorpus.tsv"
     output_dir: "outputs/eval_beir_nfcorpus"
   # - name: fever
   #   data_path: "data/icr-beir-evals/bm25-top100/fever.jsonl"
@@ -72,7 +75,7 @@ datasets:
   #   output_dir: "outputs/eval_beir_fever"
   - name: climate_fever
     data_path: "data/icr-beir-evals/bm25-top100/climate_fever.jsonl"
-    qrels_path: "/code/.cache/pyserini/topics-and-qrels/qrels.beir-v1.0.0-climate-fever.test.txt"
+    qrels_path: "data/icr-beir-evals/qrels/climate_fever.tsv"
     output_dir: "outputs/eval_beir_climate_fever"
   # - name: msmarco
   #   data_path: "data/icr-beir-evals/bm25-top100/msmarco.jsonl"

@@ -154,6 +154,191 @@ def check_left_padded_mask(attention_mask: torch.Tensor, verbose: bool = False):
         'violations_per_block': violations.sum(dim=-1),  # (B, M) - count of violations
     }
 
+
+def _additive_mask_valid_tokens(mask_row: torch.Tensor) -> torch.Tensor:
+    """Return validity mask from additive attention mask rows (0 valid, very negative masked)."""
+    threshold = torch.finfo(mask_row.dtype).min / 2
+    return mask_row > threshold
+
+
+def _select_doc_anchor_tokens_from_additive_mask(
+    doc_mask_row: torch.Tensor,
+    token_compression_mode: str,
+    token_compression_last_k: int,
+) -> torch.Tensor:
+    """Select anchor tokens (last-k or mid+last) from per-doc additive mask rows."""
+    mode = token_compression_mode.lower()
+    valid = _additive_mask_valid_tokens(doc_mask_row)
+
+    if mode == "last":
+        if token_compression_last_k <= 0:
+            raise ValueError(
+                f"token_compression_last_k must be > 0 when token_compression_mode='last', got {token_compression_last_k}"
+            )
+        H = valid.shape[-1]
+        token_idx = torch.arange(H, device=valid.device).view(*([1] * (valid.dim() - 1)), H)
+        last_idx = torch.where(valid, token_idx, torch.full_like(token_idx, -1)).amax(dim=-1)
+        first_idx = (last_idx - int(token_compression_last_k) + 1).clamp(min=0)
+        return (
+            valid
+            & (token_idx <= last_idx.unsqueeze(-1))
+            & (token_idx >= first_idx.unsqueeze(-1))
+        )
+
+    if mode == "mid_last":
+        rank = valid.cumsum(dim=-1)
+        valid_count = valid.sum(dim=-1, keepdim=True)
+        mid_rank = (valid_count + 1) // 2
+        last_rank = valid_count
+        return valid & ((rank == mid_rank) | (rank == last_rank))
+
+    return valid
+
+
+def _normalize_attention_weighted_top_k(attention_weighted_top_k: Optional[int | str]) -> Optional[int]:
+    """Normalize optional top-k config; accepts None/null/none."""
+    if attention_weighted_top_k is None:
+        return None
+    if isinstance(attention_weighted_top_k, str):
+        raw = attention_weighted_top_k.strip().lower()
+        if raw in ("", "none", "null"):
+            return None
+    top_k = int(attention_weighted_top_k)
+    if top_k <= 0:
+        raise ValueError(f"attention_weighted_top_k must be > 0 when provided, got {attention_weighted_top_k}")
+    return top_k
+
+
+def _doc_block_range(block_order: str, num_blocks: int) -> range:
+    """Return doc block index range excluding the final query block."""
+    if block_order == "instruction_first":
+        return range(1, max(num_blocks - 1, 1))
+    if block_order == "doc_first":
+        return range(0, max(num_blocks - 1, 0))
+    raise ValueError(f"Unknown block_order: {block_order}")
+
+
+def _compute_doc_attention_weighted_topk_mask_from_qk(
+    query_blocks: torch.Tensor,
+    key_blocks: torch.Tensor,
+    full_attention_mask: torch.Tensor,
+    block_order: str,
+    top_k: int,
+) -> torch.Tensor:
+    """
+    Build per-document top-k token mask using each doc's last token attending to that doc.
+
+    query_blocks/key_blocks: (B, N, M, H, D)
+    full_attention_mask: (B, 1, M, H, H), additive mask
+    returns: (B, num_docs, H) bool mask
+    """
+    if top_k <= 0:
+        raise ValueError(f"top_k must be > 0, got {top_k}")
+
+    B, N, M, H, D = query_blocks.shape
+    doc_indices = list(_doc_block_range(block_order, M))
+    num_docs = len(doc_indices)
+    if num_docs == 0:
+        return torch.zeros(B, 0, H, dtype=torch.bool, device=query_blocks.device)
+
+    token_idx = torch.arange(H, device=query_blocks.device)
+    k_eff = min(int(top_k), H)
+    doc_topk_mask = torch.zeros(B, num_docs, H, dtype=torch.bool, device=query_blocks.device)
+
+    for local_doc_idx, block_idx in enumerate(doc_indices):
+        q_doc = query_blocks[:, :, block_idx, :, :]  # (B, N, H, D)
+        k_doc = key_blocks[:, :, block_idx, :, :]    # (B, N, H, D)
+        self_mask = full_attention_mask[:, 0, block_idx, :, :]  # (B, H, H)
+
+        valid = _additive_mask_valid_tokens(self_mask[:, -1, :])  # (B, H)
+        last_idx = torch.where(
+            valid,
+            token_idx.view(1, H),
+            torch.full((1, H), -1, device=valid.device, dtype=token_idx.dtype),
+        ).amax(dim=-1)  # (B,)
+        has_valid = last_idx >= 0
+        safe_last_idx = last_idx.clamp(min=0).to(torch.long)
+
+        q_last = torch.gather(
+            q_doc,
+            dim=2,
+            index=safe_last_idx.view(B, 1, 1, 1).expand(B, N, 1, D),
+        ).squeeze(2)  # (B, N, D)
+        mask_row = torch.gather(
+            self_mask,
+            dim=1,
+            index=safe_last_idx.view(B, 1, 1).expand(B, 1, H),
+        ).squeeze(1)  # (B, H)
+
+        logits = torch.einsum("bnd,bnhd->bnh", q_last, k_doc)
+        logits = logits + mask_row[:, None, :].to(logits.dtype)
+        logits = logits.masked_fill(~has_valid[:, None, None], float("-inf"))
+
+        head_reduced_logits = logits.mean(dim=1)  # (B, H)
+        topk_idx = head_reduced_logits.topk(k=k_eff, dim=-1).indices
+
+        keep = torch.zeros(B, H, dtype=torch.bool, device=query_blocks.device)
+        keep.scatter_(1, topk_idx, True)
+        doc_topk_mask[:, local_doc_idx, :] = keep & valid & has_valid[:, None]
+
+    return doc_topk_mask
+
+
+def _compress_query_doc_visibility_mask(
+    mask_others_blocks: torch.Tensor,
+    block_order: str,
+    token_compression_mode: str,
+    token_compression_last_k: int,
+    attention_weighted_top_k: Optional[int | str] = 1,
+    query_blocks: Optional[torch.Tensor] = None,
+    key_blocks: Optional[torch.Tensor] = None,
+    full_attention_mask: Optional[torch.Tensor] = None,
+) -> torch.Tensor:
+    """Compress doc-token visibility only for the last query block attending to docs."""
+    mode = (token_compression_mode or "none").lower()
+    if mode not in ("none", "topk", "last", "mid_last"):
+        raise ValueError(f"Unknown token_compression_mode: {token_compression_mode}")
+    aw_top_k = _normalize_attention_weighted_top_k(attention_weighted_top_k)
+
+    _, _, prev_blocks, _ = mask_others_blocks.shape
+    if block_order == "instruction_first":
+        doc_slice = slice(1, prev_blocks)
+    elif block_order == "doc_first":
+        doc_slice = slice(0, prev_blocks)
+    else:
+        raise ValueError(f"Unknown block_order: {block_order}")
+
+    out = mask_others_blocks.clone()
+    doc_rows = out[:, :, doc_slice, :]
+    if doc_rows.numel() == 0:
+        return out
+
+    # Default keep-set is last-k (or mid+last for legacy mode).
+    default_mode = "mid_last" if mode == "mid_last" else "last"
+    doc_keep = _select_doc_anchor_tokens_from_additive_mask(
+        doc_mask_row=doc_rows,
+        token_compression_mode=default_mode,
+        token_compression_last_k=int(token_compression_last_k),
+    )
+
+    if aw_top_k is not None:
+        if query_blocks is None or key_blocks is None or full_attention_mask is None:
+            raise ValueError(
+                "query_blocks, key_blocks and full_attention_mask are required when attention_weighted_top_k is used."
+            )
+        aw_keep = _compute_doc_attention_weighted_topk_mask_from_qk(
+            query_blocks=query_blocks,
+            key_blocks=key_blocks,
+            full_attention_mask=full_attention_mask,
+            block_order=block_order,
+            top_k=aw_top_k,
+        )  # (B, num_docs, H)
+        doc_keep = doc_keep | aw_keep.unsqueeze(1)
+
+    masked_value = 0.7 * torch.finfo(out.dtype).min
+    out[:, :, doc_slice, :] = torch.where(doc_keep, doc_rows, torch.full_like(doc_rows, masked_value))
+    return out
+
 def eager_blockrank_attention_forward(
     module: nn.Module,
     query: torch.Tensor,
@@ -304,8 +489,25 @@ def eager_blockrank_attention_forward(
     K_all = K.reshape(B, N, M * H, D)                            # (B, N, M*H, D)
     V_all = V.reshape(B, N, M * H, D)                            # (B, N, M*H, D)
 
-    # Mask for other blocks (0..M-2): take last row and broadcast over query rows
+    # Mask for other blocks (0..M-2): take last row and broadcast over query rows.
+    # Optional token compression is applied ONLY when the last query block attends to doc blocks.
+    token_compression_mode = kwargs.get("token_compression_mode", "none")
+    token_compression_last_k = kwargs.get("token_compression_last_k", 1)
+    if token_compression_last_k is None:
+        token_compression_last_k = 1
+    token_compression_last_k = int(token_compression_last_k)
+    attention_weighted_top_k = kwargs.get("attention_weighted_top_k", 1)
     mask_others = attention_mask[:, :, :M-1, -1, :]              # (B, 1, M-1, H)
+    mask_others = _compress_query_doc_visibility_mask(
+        mask_others_blocks=mask_others,
+        block_order=block_order,
+        token_compression_mode=token_compression_mode,
+        token_compression_last_k=token_compression_last_k,
+        attention_weighted_top_k=attention_weighted_top_k,
+        query_blocks=Q,
+        key_blocks=K,
+        full_attention_mask=attention_mask,
+    )
     mask_others = mask_others.reshape(B, 1, (M - 1) * H)         # (B, 1, (M-1)*H)
     mask_others = mask_others.unsqueeze(-2).expand(B, 1, H, (M - 1) * H)  # (B, 1, H, (M-1)*H)
     mask_self_last = attention_mask[:, :, M-1]                   # (B, 1, H, H)
@@ -719,8 +921,25 @@ def sdpa_blockrank_attention_forward(
     K_all = K.reshape(B, N, M * H, D)                            # (B, N, M*H, D)
     V_all = V.reshape(B, N, M * H, D)                            # (B, N, M*H, D)
 
-    # Mask for other blocks (0..M-2): take last row and broadcast over query rows
+    # Mask for other blocks (0..M-2): take last row and broadcast over query rows.
+    # Optional token compression is applied ONLY when the last query block attends to doc blocks.
+    token_compression_mode = kwargs.get("token_compression_mode", "none")
+    token_compression_last_k = kwargs.get("token_compression_last_k", 1)
+    if token_compression_last_k is None:
+        token_compression_last_k = 1
+    token_compression_last_k = int(token_compression_last_k)
+    attention_weighted_top_k = kwargs.get("attention_weighted_top_k", 1)
     mask_others = attention_mask[:, :, :M-1, -1, :]              # (B, 1, M-1, H)
+    mask_others = _compress_query_doc_visibility_mask(
+        mask_others_blocks=mask_others,
+        block_order=block_order,
+        token_compression_mode=token_compression_mode,
+        token_compression_last_k=token_compression_last_k,
+        attention_weighted_top_k=attention_weighted_top_k,
+        query_blocks=Q,
+        key_blocks=K,
+        full_attention_mask=attention_mask,
+    )
     mask_others = mask_others.reshape(B, 1, (M - 1) * H)         # (B, 1, (M-1)*H)
     mask_others = mask_others.unsqueeze(-2).expand(B, 1, H, (M - 1) * H)  # (B, 1, H, (M-1)*H)
     mask_self_last = attention_mask[:, :, M-1]                   # (B, 1, H, H)

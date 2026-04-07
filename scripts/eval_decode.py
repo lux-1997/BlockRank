@@ -69,6 +69,7 @@ def main():
             eval_mode=True,
             block_order=margs.block_order,
             query_in_instruction=dargs.query_in_instruction,
+            remove_doc_id=dargs.remove_doc_id,
         )
         eval_ds = ds["test"] if ds.get("test", None) is not None else ds["train"]
 

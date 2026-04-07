@@ -7,7 +7,6 @@ model:
   trust_remote_code: false
   use_blockrank: true
   attn_implementation: "default_blockrank" 
-  block_order: "doc_first"
 
 data:
   data_path: "data/train/parsed_hard_ids_10p_train.jsonl"  # Full dataset
@@ -19,9 +18,10 @@ data:
   dataset_seed: 42
   max_block_length: 160
   query_in_instruction: false
+  remove_doc_id: true  # true => remove explicit 'ID: ... | END ID: ...' wrappers from doc blocks
 
 training:
-  output_dir: "outputs/blockrank-10p-msmarco-mistral-7b-only-copynet-doc-first-last"
+  output_dir: "outputs/blockrank-10p-msmarco-mistral-7b-only-copynet-no-prefix-query-last-4-top-1-token"
   num_train_epochs: 1
   per_device_train_batch_size: 1
   per_device_eval_batch_size: 1
@@ -51,8 +51,15 @@ training:
   aux_loss_weight: 0.5      # Lambda in paper (default: 0.1)
   aux_temperature: 0.05
   aux_query_token_offset: 0  # In BlockRank split/merge pipeline, supervised completion starts at '['
+  query_aggregation_mode: "single" # single / mean_all, logsumexp_all
+  aux_num_last_queries: 32
   aux_norm_mode: "doc_only"  # Avoid non-doc normalization collapse in last-token training
-  sft_loss_weight: 0.0 
+  sft_loss_weight: 0.0
   aux_loss_type: "copynet"      # Tau in InfoNCE loss (default: 0.1)
   token_compression_mode: "last"  # none: see all doc tokens; last: only each doc's last token
-  token_compression_last_k: 16    # used when token_compression_mode=last; set 4 => last 4 doc tokens
+  token_compression_last_k: 4    # used when token_compression_mode=last; set 4 => last 4 doc tokens
+  attention_weighted_top_k: 1   # null/none => last-k only; k => last-k + doc-last-token attention top-k
+
+  use_doc_align_loss: false         # align last-k doc representation to full-doc semantics
+  doc_align_loss_weight: 0.05      # weight for doc alignment loss
+

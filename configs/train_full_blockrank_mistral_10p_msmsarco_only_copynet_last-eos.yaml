@@ -7,7 +7,6 @@ model:
   trust_remote_code: false
   use_blockrank: true
   attn_implementation: "default_blockrank" 
-  block_order: "doc_first"
 
 data:
   data_path: "data/train/parsed_hard_ids_10p_train.jsonl"  # Full dataset
@@ -18,10 +17,12 @@ data:
   max_seq_length: 6144
   dataset_seed: 42
   max_block_length: 160
-  query_in_instruction: false
+  query_in_instruction: true
+  doc_end_token: "<eos>"        # append tokenizer.eos_token to each document block end
+  preserve_doc_last_token: true # if truncated, keep each doc block's final token (eos)
 
 training:
-  output_dir: "outputs/blockrank-10p-msmarco-mistral-7b-only-copynet-doc-first-last"
+  output_dir: "outputs/blockrank-10p-msmarco-mistral-7b-only-copynet-eos"
   num_train_epochs: 1
   per_device_train_batch_size: 1
   per_device_eval_batch_size: 1
@@ -52,7 +53,7 @@ training:
   aux_temperature: 0.05
   aux_query_token_offset: 0  # In BlockRank split/merge pipeline, supervised completion starts at '['
   aux_norm_mode: "doc_only"  # Avoid non-doc normalization collapse in last-token training
-  sft_loss_weight: 0.0 
+  sft_loss_weight: 0.1 
   aux_loss_type: "copynet"      # Tau in InfoNCE loss (default: 0.1)
   token_compression_mode: "last"  # none: see all doc tokens; last: only each doc's last token
-  token_compression_last_k: 16    # used when token_compression_mode=last; set 4 => last 4 doc tokens
+  token_compression_last_k: 16     # used when token_compression_mode=last; set 4 => last 4 doc tokens

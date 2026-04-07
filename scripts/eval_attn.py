@@ -118,6 +118,106 @@ def _masked_mean(values: torch.Tensor, mask: torch.Tensor, dim: int = -1) -> tor
     return (values * mask).sum(dim=dim) / denom
 
 
+def _last_k_valid_token_mask(mask: torch.Tensor, last_k: int = 1) -> torch.Tensor:
+    """Return a mask that keeps only the last-k valid tokens on the last dimension."""
+    if last_k <= 0:
+        raise ValueError(f"last_k must be > 0, got {last_k}")
+    valid = mask.bool()
+    H = valid.shape[-1]
+    token_idx = torch.arange(H, device=valid.device).view(*([1] * (valid.dim() - 1)), H)
+    last_idx = torch.where(valid, token_idx, torch.full_like(token_idx, -1)).amax(dim=-1)
+    first_idx = (last_idx - int(last_k) + 1).clamp(min=0)
+    return (
+        valid
+        & (token_idx <= last_idx.unsqueeze(-1))
+        & (token_idx >= first_idx.unsqueeze(-1))
+    )
+
+
+def _mid_last_valid_token_mask(mask: torch.Tensor) -> torch.Tensor:
+    """Return a mask that keeps middle (ceil(L/2)) and last valid tokens."""
+    valid = mask.bool()
+    rank = valid.cumsum(dim=-1)
+    valid_count = valid.sum(dim=-1, keepdim=True)
+    mid_rank = (valid_count + 1) // 2
+    last_rank = valid_count
+    return valid & ((rank == mid_rank) | (rank == last_rank))
+
+
+def _normalize_optional_top_k(value: int | str | None, field_name: str = "attention_weighted_top_k") -> int | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        raw = value.strip().lower()
+        if raw in ("", "none", "null"):
+            return None
+    top_k = int(value)
+    if top_k <= 0:
+        raise ValueError(f"{field_name} must be > 0 when provided")
+    return top_k
+
+
+def _build_query_selection_mask(
+    labels: torch.Tensor,
+    h1: int,
+    query_aggregation_mode: str = "single",
+    query_token_mask: torch.Tensor | None = None,
+) -> torch.Tensor:
+    last_h1_labels = labels[:, -h1:]
+    supervised_mask = last_h1_labels > -100
+    fallback_indices = supervised_mask.int().argmax(dim=-1, keepdim=True)
+    B = labels.size(0)
+    fallback_mask = torch.zeros(B, h1, dtype=torch.bool, device=labels.device)
+    fallback_mask.scatter_(1, fallback_indices, True)
+
+    mode = query_aggregation_mode.lower()
+    if mode == "single":
+        return fallback_mask
+    if mode not in ("mean_all", "logsumexp_all"):
+        raise ValueError(
+            f"Unknown query_aggregation_mode: {query_aggregation_mode}. "
+            "Expected one of ['single', 'mean_all', 'logsumexp_all']."
+        )
+    if query_token_mask is None:
+        raise ValueError(
+            f"query_token_mask is required when query_aggregation_mode='{mode}'"
+        )
+    if query_token_mask.dim() != 2:
+        raise ValueError(f"query_token_mask must be 2D, got shape={tuple(query_token_mask.shape)}")
+    if query_token_mask.size(0) != B:
+        raise ValueError(
+            f"query_token_mask batch size mismatch: {query_token_mask.size(0)} vs labels batch {B}"
+        )
+    if query_token_mask.size(1) < h1:
+        raise ValueError(
+            f"query_token_mask length {query_token_mask.size(1)} is shorter than h1={h1}"
+        )
+
+    qmask = query_token_mask[:, -h1:].bool().to(labels.device)
+    has_query = qmask.any(dim=-1)
+    return torch.where(has_query[:, None], qmask, fallback_mask)
+
+
+def _aggregate_doc_scores_over_queries(
+    doc_scores_by_query: torch.Tensor,
+    query_selection_mask: torch.Tensor,
+    query_aggregation_mode: str = "single",
+) -> torch.Tensor:
+    mode = query_aggregation_mode.lower()
+    if mode in ("single", "mean_all"):
+        mask_f = query_selection_mask.to(doc_scores_by_query.dtype)
+        denom = mask_f.sum(dim=1, keepdim=True).clamp(min=1.0)
+        return (doc_scores_by_query * mask_f.unsqueeze(-1)).sum(dim=1) / denom
+    if mode == "logsumexp_all":
+        neg_inf = torch.finfo(doc_scores_by_query.dtype).min
+        masked = doc_scores_by_query.masked_fill(~query_selection_mask.unsqueeze(-1), neg_inf)
+        return torch.logsumexp(masked, dim=1)
+    raise ValueError(
+        f"Unknown query_aggregation_mode: {query_aggregation_mode}. "
+        "Expected one of ['single', 'mean_all', 'logsumexp_all']."
+    )
+
+
 def _compute_doc_scores_with_token_compression(
     attention_scores: torch.Tensor,
     labels: torch.Tensor,
@@ -126,22 +226,30 @@ def _compute_doc_scores_with_token_compression(
     aux_norm_mode: str = "doc_plus_non_doc",
     token_compression_mode: str = "none",
     token_compression_topk: int = 8,
+    token_compression_last_k: int = 1,
+    attention_weighted_top_k: int | None = 1,
+    query_aggregation_mode: str = "single",
+    query_token_mask: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Build doc-level ranking scores from attention scores with token compression modes:
     - none: mean over all valid tokens in each document
     - topk: mean over top-k tokens (importance = attention score)
-    - last: score of the last valid token in each document
+    - last: score averaged over the last-k valid tokens in each document
+    - mid_last: score averaged over middle+last valid tokens in each document
     """
     B, M, H = attention_mask.shape
     _, N, h1, MH = attention_scores.shape
     assert MH == M * H, "Attention scores last dimension must match M*H"
 
-    last_h1_labels = labels[:, -h1:]
-    bracket_mask = last_h1_labels > -100
-    bracket_indices = bracket_mask.int().argmax(dim=-1)[:, None]
+    query_selection_mask = _build_query_selection_mask(
+        labels=labels,
+        h1=h1,
+        query_aggregation_mode=query_aggregation_mode,
+        query_token_mask=query_token_mask,
+    )
 
-    bracket_attn_logits = attention_scores.take_along_dim(bracket_indices[:, None, :, None], dim=2)
+    bracket_attn_logits = attention_scores
 
     if block_order == "instruction_first":
         doc_start = H
@@ -166,38 +274,41 @@ def _compute_doc_scores_with_token_compression(
     if aux_norm_mode not in ("doc_plus_non_doc", "doc_only"):
         raise ValueError(f"Unknown aux_norm_mode: {aux_norm_mode}")
 
-    doc_attn_lse = torch.logsumexp(bracket_attn_logits[..., doc_start:doc_end], dim=-1, keepdim=True)
+    num_docs = M - 2 if block_order == "instruction_first" else M - 1
+    doc_token_mask = attention_mask[:, doc_block_start:doc_block_end, :].bool()   # (B, num_docs, H)
+
+    mode = token_compression_mode.lower()
+    doc_logits = bracket_attn_logits[..., doc_start:doc_end]
+
+    if token_compression_last_k <= 0:
+        raise ValueError("token_compression_last_k must be > 0")
+    aw_top_k = _normalize_optional_top_k(attention_weighted_top_k, field_name="attention_weighted_top_k")
+
+    last_k_mask = _last_k_valid_token_mask(doc_token_mask, last_k=int(token_compression_last_k))
+    if aw_top_k is None:
+        # None => use last-k only
+        doc_select_mask = last_k_mask
+    else:
+        # k => use union(last-k, attention-weighted top-k visible from forward mask)
+        visible_threshold = torch.finfo(doc_logits.dtype).min / 2
+        visible_mask = (doc_logits[:, 0, 0] > visible_threshold).reshape(B, num_docs, H)
+        doc_select_mask = last_k_mask | (visible_mask & doc_token_mask)
+
+    doc_logits = doc_logits.masked_fill(
+        ~doc_select_mask.reshape(B, 1, 1, num_docs * H),
+        float("-inf"),
+    )
+
+    doc_attn_lse = torch.logsumexp(doc_logits, dim=-1, keepdim=True)
     if aux_norm_mode == "doc_plus_non_doc":
         attn_lse = torch.logaddexp(non_doc_lse.detach(), doc_attn_lse)
     else:
         attn_lse = doc_attn_lse
-    doc_attn = (bracket_attn_logits[..., doc_start:doc_end] - attn_lse).exp()
+    doc_attn = (doc_logits - attn_lse).exp()
 
-    num_docs = M - 2 if block_order == "instruction_first" else M - 1
-    doc_token_scores = doc_attn.reshape(B, N, -1, num_docs, H).mean(dim=(1, 2))  # (B, num_docs, H)
-    doc_token_mask = attention_mask[:, doc_block_start:doc_block_end, :].bool()   # (B, num_docs, H)
-
-    mode = token_compression_mode.lower()
-    if mode == "none":
-        return _masked_mean(doc_token_scores, doc_token_mask, dim=-1)
-
-    if mode == "topk":
-        if token_compression_topk <= 0:
-            raise ValueError("token_compression_topk must be > 0 when mode is topk")
-        k = min(int(token_compression_topk), H)
-        masked_scores = doc_token_scores.masked_fill(~doc_token_mask, float("-inf"))
-        topk_values = torch.topk(masked_scores, k=k, dim=-1).values
-        finite_mask = torch.isfinite(topk_values)
-        return (topk_values.masked_fill(~finite_mask, 0.0).sum(dim=-1) /
-                finite_mask.sum(dim=-1).clamp(min=1))
-
-    if mode == "last":
-        valid_counts = doc_token_mask.long().sum(dim=-1)  # (B, num_docs)
-        last_idx = (valid_counts - 1).clamp(min=0)
-        last_scores = doc_token_scores.gather(dim=-1, index=last_idx.unsqueeze(-1)).squeeze(-1)
-        return torch.where(valid_counts > 0, last_scores, torch.zeros_like(last_scores))
-
-    raise ValueError(f"Unknown token_compression_mode: {token_compression_mode}")
+    doc_token_scores = doc_attn.reshape(B, N, h1, num_docs, H)  # (B, N, h1, num_docs, H)
+    doc_scores_by_query = _masked_mean(doc_token_scores, doc_select_mask.unsqueeze(1).unsqueeze(1), dim=-1).mean(dim=1)
+    return _aggregate_doc_scores_over_queries(doc_scores_by_query, query_selection_mask, query_aggregation_mode)
 
 
 def main():
@@ -218,12 +329,25 @@ def main():
         margs.use_blockrank = True
         logger.info("BlockRank attention enabled based on attn_implementation=" + margs.attn_implementation)
     token_compression_mode = getattr(targs, "token_compression_mode", "none").lower()
-    if token_compression_mode not in {"none", "topk", "last"}:
+    token_compression_last_k = int(getattr(targs, "token_compression_last_k", 1))
+    attention_weighted_top_k = _normalize_optional_top_k(
+        getattr(targs, "attention_weighted_top_k", 1),
+        field_name="attention_weighted_top_k",
+    )
+    query_aggregation_mode = getattr(targs, "query_aggregation_mode", "single").lower()
+    aux_num_last_queries = int(getattr(targs, "aux_num_last_queries", 32))
+    if token_compression_mode not in {"none", "topk", "last", "mid_last"}:
         raise ValueError(
-            f"token_compression_mode must be one of ['none', 'topk', 'last'], got: {token_compression_mode}"
+            f"token_compression_mode must be one of ['none', 'topk', 'last', 'mid_last'], got: {token_compression_mode}"
         )
     if token_compression_mode == "topk" and int(getattr(targs, "token_compression_topk", 0)) <= 0:
         raise ValueError("token_compression_topk must be > 0 when token_compression_mode='topk'")
+    if token_compression_last_k <= 0:
+        raise ValueError("token_compression_last_k must be > 0")
+    if query_aggregation_mode not in {"single", "mean_all", "logsumexp_all"}:
+        raise ValueError(
+            f"query_aggregation_mode must be one of ['single', 'mean_all', 'logsumexp_all'], got: {query_aggregation_mode}"
+        )
 
     dataloader_config = DataLoaderConfiguration(
         split_batches=False,
@@ -265,9 +389,21 @@ def main():
             use_blockrank=margs.use_blockrank,
             block_order=margs.block_order,
             query_in_instruction=dargs.query_in_instruction,
+            remove_doc_id=dargs.remove_doc_id,
         )
         eval_ds = ds["test"] if ds.get("test", None) is not None else ds["train"]
-        qrels = load_qrels(dargs.qrels_path) if hasattr(dargs, 'qrels_path') and dargs.qrels_path and os.path.exists(dargs.qrels_path) else None
+        qrels = None
+        if hasattr(dargs, 'qrels_path') and dargs.qrels_path:
+            if os.path.exists(dargs.qrels_path):
+                qrels = load_qrels(dargs.qrels_path)
+                logger.info(f"Loaded qrels from {dargs.qrels_path}")
+            else:
+                logger.warning(
+                    f"qrels_path does not exist: {dargs.qrels_path}. "
+                    "Ranking metrics (ndcg/mrr) will be skipped."
+                )
+        else:
+            logger.warning("No qrels_path provided. Ranking metrics (ndcg/mrr) will be skipped.")
 
     accelerator.wait_for_everyone()
     logger.info(f"Loaded {len(eval_ds)} examples")
@@ -406,9 +542,13 @@ def main():
     logger.info(f"Running attention-based evaluation on {accelerator.num_processes} processes...")
     logger.info(f"Using attention layer {targs.aux_layer_idx} for predictions")
     logger.info(
-        "Token compression mode=%s topk=%s",
+        "Token compression mode=%s topk=%s last_k=%s attention_weighted_top_k=%s query_aggregation_mode=%s aux_num_last_queries=%s",
         token_compression_mode,
         getattr(targs, "token_compression_topk", None),
+        token_compression_last_k,
+        attention_weighted_top_k,
+        query_aggregation_mode,
+        aux_num_last_queries,
     )
 
     # Optimize by preventing computation in layers after the target layer
@@ -442,7 +582,16 @@ def main():
             # Forward pass with attention output
             labels = batch.pop('labels')
             _ = batch.pop('answer_ids', None)
-            out = unwrapped_model(**batch, output_attentions=True, layers_to_return_scores=[target_layer_idx], num_last_queries=32)
+            query_token_mask = batch.pop('query_token_mask', None)
+            out = unwrapped_model(
+                **batch,
+                output_attentions=True,
+                layers_to_return_scores=[target_layer_idx],
+                num_last_queries=aux_num_last_queries,
+                token_compression_mode=token_compression_mode,
+                token_compression_last_k=token_compression_last_k,
+                attention_weighted_top_k=attention_weighted_top_k,
+            )
 
             doc_scores = _compute_doc_scores_with_token_compression(
                 attention_scores=out.attentions[0],
@@ -452,6 +601,10 @@ def main():
                 aux_norm_mode=getattr(targs, "aux_norm_mode", "doc_plus_non_doc"),
                 token_compression_mode=token_compression_mode,
                 token_compression_topk=int(getattr(targs, "token_compression_topk", 8)),
+                token_compression_last_k=token_compression_last_k,
+                attention_weighted_top_k=attention_weighted_top_k,
+                query_aggregation_mode=query_aggregation_mode,
+                query_token_mask=query_token_mask,
             )
 
             # Get top-k predictions (k=10 for ranking metrics)
@@ -487,6 +640,10 @@ def main():
             "attn_layer": targs.aux_layer_idx,
             "token_compression_mode": token_compression_mode,
             "token_compression_topk": int(getattr(targs, "token_compression_topk", 8)),
+            "token_compression_last_k": token_compression_last_k,
+            "attention_weighted_top_k": attention_weighted_top_k,
+            "query_aggregation_mode": query_aggregation_mode,
+            "aux_num_last_queries": aux_num_last_queries,
         }
         with open(metrics_file, "w") as f:
             json.dump(results_with_config, f, indent=2)
@@ -496,6 +653,13 @@ def main():
         logger.info(f"  Token Compression Mode: {token_compression_mode}")
         if token_compression_mode == "topk":
             logger.info(f"  Token Compression Top-k: {int(getattr(targs, 'token_compression_topk', 8))}")
+        if token_compression_mode == "last":
+            logger.info(f"  Token Compression Last-k: {token_compression_last_k}")
+        if token_compression_mode == "mid_last":
+            logger.info("  Token Compression Anchors: middle + last")
+        logger.info(f"  Attention Weighted Top-k: {attention_weighted_top_k}")
+        logger.info(f"  Query Aggregation Mode: {query_aggregation_mode}")
+        logger.info(f"  Aux Num Last Queries: {aux_num_last_queries}")
         for k, v in results.items():
             logger.info(f"  {k}: {v:.4f}" if isinstance(v, float) else f"  {k}: {v}")
         logger.info(f"{'='*50}\n")

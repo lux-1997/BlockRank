@@ -26,6 +26,8 @@ def load_icr_dataset_hf(
     prompt_type: str | None = None,
     block_order: str = "instruction_first",
     query_in_instruction: bool = True,
+    remove_doc_id: bool = False,
+    doc_end_token: str | None = None,
     **kwargs,
 ) -> DatasetDict:
     """
@@ -66,6 +68,19 @@ def load_icr_dataset_hf(
     PROMPT_SEGMENT_SEP = "<<end_of_block_prompt_segment>>" if use_blockrank else "\n"
     PROMPT_TYPE = prompt_type or ("mistral" if "mistral" in tokenizer.name_or_path.lower() else "qwen")
     print(f"[load_icr_dataset_hf] Using PROMPT_TYPE={PROMPT_TYPE}")
+    resolved_doc_end_token = doc_end_token
+    if isinstance(doc_end_token, str):
+        marker = doc_end_token.strip()
+        if marker == "":
+            resolved_doc_end_token = None
+        elif marker.lower() == "<eos>":
+            if tokenizer.eos_token is None:
+                raise ValueError("doc_end_token='<eos>' but tokenizer.eos_token is None")
+            resolved_doc_end_token = tokenizer.eos_token
+    if resolved_doc_end_token:
+        print(f"[load_icr_dataset_hf] Appending doc_end_token={repr(resolved_doc_end_token)} to each document block")
+    if remove_doc_id:
+        print("[load_icr_dataset_hf] remove_doc_id=True: omitting explicit document IDs in prompt blocks")
     print_prompt_example = os.environ.get("PRINT_PROMPT_EXAMPLE", "0") == "1"
     map_num_proc = 1 if eval_mode else max(1, os.cpu_count() - 2)
 
@@ -104,6 +119,8 @@ def load_icr_dataset_hf(
             type=PROMPT_TYPE,
             block_order=block_order,
             query_in_instruction=query_in_instruction,
+            remove_doc_id=remove_doc_id,
+            doc_end_token=resolved_doc_end_token,
         )
         if print_prompt_example and idx == 0:
             prompt_msg = pc["prompt"][0].get("content", "") if pc.get("prompt") else ""
@@ -170,7 +187,37 @@ def load_icr_dataset_hf(
         }
 
     def _block_tokenize_batch(batch):
+        def _find_query_token_positions(block_text: str, query_text: str) -> list[int]:
+            if not block_text or not query_text:
+                return []
+            spans = []
+            start = 0
+            while True:
+                idx = block_text.find(query_text, start)
+                if idx < 0:
+                    break
+                spans.append((idx, idx + len(query_text)))
+                start = idx + len(query_text)
+            if not spans:
+                return []
+
+            encoded = tokenizer(
+                block_text,
+                add_special_tokens=False,
+                return_attention_mask=False,
+                return_offsets_mapping=True,
+            )
+            offsets = encoded.get('offset_mapping', [])
+            q_positions = []
+            for tidx, (c0, c1) in enumerate(offsets):
+                if c1 <= c0:
+                    continue
+                if any((c0 < e and c1 > s) for s, e in spans):
+                    q_positions.append(int(tidx))
+            return q_positions
+
         all_block_input_texts = []
+        all_last_prompt_query_positions = []
         raw_prompt_env = os.environ.get("BLOCKRANK_RAW_PROMPT")
         raw_prompt = False if raw_prompt_env is None else (raw_prompt_env == "1")
         for itr in range(len(batch['prompt'])):
@@ -191,6 +238,14 @@ def load_icr_dataset_hf(
             block_input_texts = [f'\n{x}' if i > 0 and i < n-1 else x for i, x in enumerate(block_input_texts)]
             all_block_input_texts.append(block_input_texts)
 
+            query_text = batch.get('query', [''] * len(batch['prompt']))[itr] or ''
+            if len(block_input_texts) >= 2:
+                last_prompt_block_text = block_input_texts[-2]
+                q_positions = _find_query_token_positions(last_prompt_block_text, query_text)
+            else:
+                q_positions = []
+            all_last_prompt_query_positions.append(q_positions)
+
         indptr = np.cumsum([0] + [len(x) for x in all_block_input_texts])
 
         all_block_input_ids = tokenizer(
@@ -204,7 +259,9 @@ def load_icr_dataset_hf(
         return {
             'input_ids': all_block_input_ids,
             'block_lengths': block_lengths,
+            'last_prompt_query_positions': all_last_prompt_query_positions,
         }
+
 
     ds_dict = ds_dict.map(
         _sample_and_format,
@@ -278,6 +335,7 @@ def block_icr_collate_fn(
     permutation_invariant_pos=True,
     position_id_mode: str | None = None,
     block_order: str = "instruction_first",
+    preserve_doc_last_token: bool = False,
 ) -> Dict[str, torch.Tensor]:
     pad_token_id = tok.pad_token_id
     padding_side = tok.padding_side
@@ -311,7 +369,24 @@ def block_icr_collate_fn(
     all_block_input_ids = []
     for item in batch:
         indptr = torch.cumsum(torch.cat([torch.tensor([0]), item['block_lengths']]), dim=0)
-        item['block_input_ids'] = [item['input_ids'][indptr[i]:indptr[i+1]][:max_block_length] for i in range(len(item['block_lengths']))]
+        block_input_ids = []
+        for i in range(len(item['block_lengths'])):
+            block_ids = item['input_ids'][indptr[i]:indptr[i+1]]
+            if block_ids.numel() > max_block_length:
+                # Keep each document block's final token under truncation (used with doc_end_token=<eos>).
+                last_block_idx = len(item['block_lengths']) - 1
+                if block_order == "instruction_first":
+                    is_doc_block = (i > 0) and (i < last_block_idx)
+                elif block_order == "doc_first":
+                    is_doc_block = i < last_block_idx
+                else:
+                    raise ValueError(f"Unknown block_order: {block_order}")
+                if preserve_doc_last_token and is_doc_block and max_block_length > 1:
+                    block_ids = torch.cat([block_ids[:max_block_length - 1], block_ids[-1:]], dim=0)
+                else:
+                    block_ids = block_ids[:max_block_length]
+            block_input_ids.append(block_ids)
+        item['block_input_ids'] = block_input_ids
         all_block_input_ids.extend(item['block_input_ids'])
 
     padding_input_id = torch.full((max_block_length,), pad_token_id, dtype=torch.long)
@@ -353,6 +428,26 @@ def block_icr_collate_fn(
         -100, 
         labels[:, -1, :]) # prompt tokens not to be predicted
 
+    # Build precise query-token mask on the last block (shape: B, H).
+    query_token_mask = torch.zeros((B, H), dtype=torch.bool, device=input_ids.device)
+    for bi, item in enumerate(batch):
+        qpos = item.get('last_prompt_query_positions', [])
+        if torch.is_tensor(qpos):
+            qpos = qpos.tolist()
+        qpos = [int(x) for x in qpos]
+
+        orig_last_len = item['block_lengths'][-1]
+        if torch.is_tensor(orig_last_len):
+            orig_last_len = int(orig_last_len.item())
+        else:
+            orig_last_len = int(orig_last_len)
+        effective_last_len = min(orig_last_len, max_block_length)
+        left_pad_shift = (max_block_length - effective_last_len) if padding_side == 'left' else 0
+
+        for pos in qpos:
+            if 0 <= pos < effective_last_len:
+                query_token_mask[bi, pos + left_pad_shift] = True
+
     if position_id_mode is None:
         position_id_mode = "perm_invariant" if permutation_invariant_pos else "sequential"
 
@@ -387,4 +482,5 @@ def block_icr_collate_fn(
         'labels': labels.view(B, M*H),
         'num_blocks': torch.tensor(M, dtype=torch.long, device=input_ids.device),
         'answer_ids': answer_ids_padded,  # Padded 2D tensor (B, max_num_answers)
+        'query_token_mask': query_token_mask,
     }

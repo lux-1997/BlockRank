@@ -1,16 +1,15 @@
 # Configuration for large-scale training on full dataset
 
 model:
-  model_name_or_path: ".cache/huggingface/Mistral-7B-Instruct-v0.3"
+  model_name_or_path: "/code/.cache/huggingface/Mistral-7B-Instruct-v0.3"
   use_4bit: false
   use_lora: false
   trust_remote_code: false
   use_blockrank: true
   attn_implementation: "default_blockrank" 
-  block_order: "doc_first"
 
 data:
-  data_path: "data/train/parsed_hard_ids_10p_train.jsonl"  # Full dataset
+  data_path: "/code/in_context_retrieval/BlockRank/data/train/parsed_hard_ids_10p_train.jsonl"  # Full dataset
   streaming: false
   val_data_path: null  # Separate validation
   num_documents: 30
@@ -18,10 +17,10 @@ data:
   max_seq_length: 6144
   dataset_seed: 42
   max_block_length: 160
-  query_in_instruction: false
+  query_in_instruction: true
 
 training:
-  output_dir: "outputs/blockrank-10p-msmarco-mistral-7b-only-copynet-doc-first-last"
+  output_dir: "outputs/blockrank-10p-msmarco-mistral-7b-only-copynet-last"
   num_train_epochs: 1
   per_device_train_batch_size: 1
   per_device_eval_batch_size: 1
@@ -48,11 +47,9 @@ training:
   metric_for_best_model: "eval_loss"
   use_aux_loss: true        # Enable auxiliary attention loss
   aux_layer_idx: 20         # Layer to extract attention scores (l* in paper)
-  aux_loss_weight: 0.5      # Lambda in paper (default: 0.1)
+  aux_loss_weight: 1.0      # Lambda in paper (default: 0.1)
   aux_temperature: 0.05
-  aux_query_token_offset: 0  # In BlockRank split/merge pipeline, supervised completion starts at '['
-  aux_norm_mode: "doc_only"  # Avoid non-doc normalization collapse in last-token training
   sft_loss_weight: 0.0 
   aux_loss_type: "copynet"      # Tau in InfoNCE loss (default: 0.1)
-  token_compression_mode: "last"  # none: see all doc tokens; last: only each doc's last token
-  token_compression_last_k: 16    # used when token_compression_mode=last; set 4 => last 4 doc tokens
+  token_compression_mode: "last"
+  token_compression_last_k: 1
