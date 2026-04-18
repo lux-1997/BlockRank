@@ -14,7 +14,7 @@ set -euo pipefail
 
 CONFIG=${1:-configs/eval_mistral_beir.yaml}
 if [ $# -gt 0 ]; then shift; fi
-CKPT=${1:-/data/mengrui/test_lx/OLM2Vec/BlockRank/outputs/blockrank-10p-msmarco-mistral-7b-only-copynet-no-prefix-query-last-32-token}
+CKPT=${1:-/data/mengrui/test_lx/OLM2Vec/BlockRank/outputs/blockrank-10p-msmarco-mistral-7b-only-copynet-segment-20-end}
 if [ $# -gt 0 ]; then shift; fi
 
 # Disable W&B network/login; override by exporting WANDB_DISABLED=false or WANDB_MODE=online if you really want logging.

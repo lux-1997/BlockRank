@@ -77,6 +77,8 @@ class BlockRankAuxLossTrainer(SFTTrainer):
             aux_layer_idx = self.args.aux_layer_idx
             token_compression_mode = getattr(self.args, "token_compression_mode", "none").lower()
             token_compression_last_k = int(getattr(self.args, "token_compression_last_k", 1))
+            token_compression_segment_k = int(getattr(self.args, "token_compression_segment_k", 10))
+            token_compression_segment_anchor = str(getattr(self.args, "token_compression_segment_anchor", "end")).lower()
             attention_weighted_top_k = getattr(self.args, "attention_weighted_top_k", 1)
             if isinstance(attention_weighted_top_k, str) and attention_weighted_top_k.strip().lower() in ("none", "null", ""):
                 attention_weighted_top_k = None
@@ -84,12 +86,22 @@ class BlockRankAuxLossTrainer(SFTTrainer):
                 attention_weighted_top_k = int(attention_weighted_top_k)
             query_aggregation_mode = getattr(self.args, "query_aggregation_mode", "single").lower()
             block_order = getattr(self.model.config, "blockrank_block_order", "instruction_first")
-            if token_compression_mode not in ("none", "last", "mid_last", "topk"):
+            if token_compression_mode not in ("none", "last", "mid_last", "topk", "segment"):
                 raise ValueError(f"Unknown token_compression_mode: {token_compression_mode}")
             if token_compression_last_k <= 0:
                 raise ValueError(
                     f"token_compression_last_k must be > 0, got: {token_compression_last_k}"
                 )
+            if token_compression_mode == "segment":
+                if token_compression_segment_k <= 0:
+                    raise ValueError(
+                        f"token_compression_segment_k must be > 0, got: {token_compression_segment_k}"
+                    )
+                if token_compression_segment_anchor not in ("start", "end"):
+                    raise ValueError(
+                        "token_compression_segment_anchor must be one of ['start', 'end'], got: "
+                        f"{token_compression_segment_anchor}"
+                    )
             if attention_weighted_top_k is not None and attention_weighted_top_k <= 0:
                 raise ValueError(
                     f"attention_weighted_top_k must be > 0 when provided, got: {attention_weighted_top_k}"
@@ -103,7 +115,7 @@ class BlockRankAuxLossTrainer(SFTTrainer):
             use_doc_align_loss = bool(getattr(self.args, "use_doc_align_loss", False))
             doc_align_loss_weight = float(getattr(self.args, "doc_align_loss_weight", 0.0))
             compute_doc_align = (
-                use_doc_align_loss and doc_align_loss_weight > 0.0 and token_compression_mode in ("last", "mid_last")
+                use_doc_align_loss and doc_align_loss_weight > 0.0 and token_compression_mode in ("last", "mid_last", "segment")
             )
 
             # Prepare model inputs (exclude non-model keys)
@@ -133,6 +145,8 @@ class BlockRankAuxLossTrainer(SFTTrainer):
                 num_last_queries=num_last_queries,
                 token_compression_mode=token_compression_mode,
                 token_compression_last_k=token_compression_last_k,
+                token_compression_segment_k=token_compression_segment_k,
+                token_compression_segment_anchor=token_compression_segment_anchor,
                 attention_weighted_top_k=attention_weighted_top_k,
             )
 
@@ -187,6 +201,8 @@ class BlockRankAuxLossTrainer(SFTTrainer):
                 aux_norm_mode=getattr(self.args, "aux_norm_mode", "doc_plus_non_doc"),
                 token_compression_mode=token_compression_mode,
                 token_compression_last_k=token_compression_last_k,
+                token_compression_segment_k=token_compression_segment_k,
+                token_compression_segment_anchor=token_compression_segment_anchor,
                 attention_weighted_top_k=attention_weighted_top_k,
                 query_aggregation_mode=query_aggregation_mode,
                 query_token_mask=inputs.get("query_token_mask", None),

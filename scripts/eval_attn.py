@@ -144,6 +144,24 @@ def _mid_last_valid_token_mask(mask: torch.Tensor) -> torch.Tensor:
     return valid & ((rank == mid_rank) | (rank == last_rank))
 
 
+def _segment_valid_token_mask(mask: torch.Tensor, segment_k: int = 10, anchor: str = "end") -> torch.Tensor:
+    """Return a mask that keeps one valid token every k positions, anchored at start/end."""
+    if segment_k <= 0:
+        raise ValueError(f"segment_k must be > 0, got {segment_k}")
+    anchor = anchor.lower()
+    if anchor not in ("start", "end"):
+        raise ValueError(f"anchor must be one of ['start', 'end'], got {anchor}")
+    valid = mask.bool()
+    rank = valid.cumsum(dim=-1) - 1
+    if anchor == "start":
+        keep = (rank.remainder(int(segment_k)) == 0)
+    else:
+        valid_count = valid.sum(dim=-1, keepdim=True)
+        dist_from_end = valid_count - 1 - rank
+        keep = (dist_from_end.remainder(int(segment_k)) == 0)
+    return valid & keep
+
+
 def _normalize_optional_top_k(value: int | str | None, field_name: str = "attention_weighted_top_k") -> int | None:
     if value is None:
         return None
@@ -227,6 +245,8 @@ def _compute_doc_scores_with_token_compression(
     token_compression_mode: str = "none",
     token_compression_topk: int = 8,
     token_compression_last_k: int = 1,
+    token_compression_segment_k: int = 10,
+    token_compression_segment_anchor: str = "end",
     attention_weighted_top_k: int | None = 1,
     query_aggregation_mode: str = "single",
     query_token_mask: torch.Tensor | None = None,
@@ -237,6 +257,7 @@ def _compute_doc_scores_with_token_compression(
     - topk: mean over top-k tokens (importance = attention score)
     - last: score averaged over the last-k valid tokens in each document
     - mid_last: score averaged over middle+last valid tokens in each document
+    - segment: keep one token every k positions (anchor by token_compression_segment_anchor)
     """
     B, M, H = attention_mask.shape
     _, N, h1, MH = attention_scores.shape
@@ -283,16 +304,31 @@ def _compute_doc_scores_with_token_compression(
     if token_compression_last_k <= 0:
         raise ValueError("token_compression_last_k must be > 0")
     aw_top_k = _normalize_optional_top_k(attention_weighted_top_k, field_name="attention_weighted_top_k")
+    if mode == "segment":
+        if int(token_compression_segment_k) <= 0:
+            raise ValueError("token_compression_segment_k must be > 0")
+        if str(token_compression_segment_anchor).lower() not in {"start", "end"}:
+            raise ValueError(
+                "token_compression_segment_anchor must be one of ['start', 'end']"
+            )
+        aw_top_k = None
 
-    last_k_mask = _last_k_valid_token_mask(doc_token_mask, last_k=int(token_compression_last_k))
-    if aw_top_k is None:
-        # None => use last-k only
-        doc_select_mask = last_k_mask
+    if mode == "segment":
+        doc_select_mask = _segment_valid_token_mask(
+            doc_token_mask,
+            segment_k=int(token_compression_segment_k),
+            anchor=token_compression_segment_anchor,
+        )
     else:
-        # k => use union(last-k, attention-weighted top-k visible from forward mask)
-        visible_threshold = torch.finfo(doc_logits.dtype).min / 2
-        visible_mask = (doc_logits[:, 0, 0] > visible_threshold).reshape(B, num_docs, H)
-        doc_select_mask = last_k_mask | (visible_mask & doc_token_mask)
+        last_k_mask = _last_k_valid_token_mask(doc_token_mask, last_k=int(token_compression_last_k))
+        if aw_top_k is None:
+            # None => use last-k only
+            doc_select_mask = last_k_mask
+        else:
+            # k => use union(last-k, attention-weighted top-k visible from forward mask)
+            visible_threshold = torch.finfo(doc_logits.dtype).min / 2
+            visible_mask = (doc_logits[:, 0, 0] > visible_threshold).reshape(B, num_docs, H)
+            doc_select_mask = last_k_mask | (visible_mask & doc_token_mask)
 
     doc_logits = doc_logits.masked_fill(
         ~doc_select_mask.reshape(B, 1, 1, num_docs * H),
@@ -330,20 +366,29 @@ def main():
         logger.info("BlockRank attention enabled based on attn_implementation=" + margs.attn_implementation)
     token_compression_mode = getattr(targs, "token_compression_mode", "none").lower()
     token_compression_last_k = int(getattr(targs, "token_compression_last_k", 1))
+    token_compression_segment_k = int(getattr(targs, "token_compression_segment_k", 10))
+    token_compression_segment_anchor = str(getattr(targs, "token_compression_segment_anchor", "end")).lower()
     attention_weighted_top_k = _normalize_optional_top_k(
         getattr(targs, "attention_weighted_top_k", 1),
         field_name="attention_weighted_top_k",
     )
     query_aggregation_mode = getattr(targs, "query_aggregation_mode", "single").lower()
     aux_num_last_queries = int(getattr(targs, "aux_num_last_queries", 32))
-    if token_compression_mode not in {"none", "topk", "last", "mid_last"}:
+    if token_compression_mode not in {"none", "topk", "last", "mid_last", "segment"}:
         raise ValueError(
-            f"token_compression_mode must be one of ['none', 'topk', 'last', 'mid_last'], got: {token_compression_mode}"
+            f"token_compression_mode must be one of ['none', 'topk', 'last', 'mid_last', 'segment'], got: {token_compression_mode}"
         )
     if token_compression_mode == "topk" and int(getattr(targs, "token_compression_topk", 0)) <= 0:
         raise ValueError("token_compression_topk must be > 0 when token_compression_mode='topk'")
     if token_compression_last_k <= 0:
         raise ValueError("token_compression_last_k must be > 0")
+    if token_compression_mode == "segment":
+        if token_compression_segment_k <= 0:
+            raise ValueError("token_compression_segment_k must be > 0 when token_compression_mode='segment'")
+        if token_compression_segment_anchor not in {"start", "end"}:
+            raise ValueError(
+                "token_compression_segment_anchor must be one of ['start', 'end'] when token_compression_mode='segment'"
+            )
     if query_aggregation_mode not in {"single", "mean_all", "logsumexp_all"}:
         raise ValueError(
             f"query_aggregation_mode must be one of ['single', 'mean_all', 'logsumexp_all'], got: {query_aggregation_mode}"
@@ -542,10 +587,12 @@ def main():
     logger.info(f"Running attention-based evaluation on {accelerator.num_processes} processes...")
     logger.info(f"Using attention layer {targs.aux_layer_idx} for predictions")
     logger.info(
-        "Token compression mode=%s topk=%s last_k=%s attention_weighted_top_k=%s query_aggregation_mode=%s aux_num_last_queries=%s",
+        "Token compression mode=%s topk=%s last_k=%s segment_k=%s segment_anchor=%s attention_weighted_top_k=%s query_aggregation_mode=%s aux_num_last_queries=%s",
         token_compression_mode,
         getattr(targs, "token_compression_topk", None),
         token_compression_last_k,
+        token_compression_segment_k,
+        token_compression_segment_anchor,
         attention_weighted_top_k,
         query_aggregation_mode,
         aux_num_last_queries,
@@ -590,6 +637,8 @@ def main():
                 num_last_queries=aux_num_last_queries,
                 token_compression_mode=token_compression_mode,
                 token_compression_last_k=token_compression_last_k,
+                token_compression_segment_k=token_compression_segment_k,
+                token_compression_segment_anchor=token_compression_segment_anchor,
                 attention_weighted_top_k=attention_weighted_top_k,
             )
 
@@ -602,6 +651,8 @@ def main():
                 token_compression_mode=token_compression_mode,
                 token_compression_topk=int(getattr(targs, "token_compression_topk", 8)),
                 token_compression_last_k=token_compression_last_k,
+                token_compression_segment_k=token_compression_segment_k,
+                token_compression_segment_anchor=token_compression_segment_anchor,
                 attention_weighted_top_k=attention_weighted_top_k,
                 query_aggregation_mode=query_aggregation_mode,
                 query_token_mask=query_token_mask,
@@ -641,6 +692,8 @@ def main():
             "token_compression_mode": token_compression_mode,
             "token_compression_topk": int(getattr(targs, "token_compression_topk", 8)),
             "token_compression_last_k": token_compression_last_k,
+            "token_compression_segment_k": token_compression_segment_k,
+            "token_compression_segment_anchor": token_compression_segment_anchor,
             "attention_weighted_top_k": attention_weighted_top_k,
             "query_aggregation_mode": query_aggregation_mode,
             "aux_num_last_queries": aux_num_last_queries,
@@ -657,6 +710,9 @@ def main():
             logger.info(f"  Token Compression Last-k: {token_compression_last_k}")
         if token_compression_mode == "mid_last":
             logger.info("  Token Compression Anchors: middle + last")
+        if token_compression_mode == "segment":
+            logger.info(f"  Token Compression Segment-k: {token_compression_segment_k}")
+            logger.info(f"  Token Compression Segment Anchor: {token_compression_segment_anchor}")
         logger.info(f"  Attention Weighted Top-k: {attention_weighted_top_k}")
         logger.info(f"  Query Aggregation Mode: {query_aggregation_mode}")
         logger.info(f"  Aux Num Last Queries: {aux_num_last_queries}")

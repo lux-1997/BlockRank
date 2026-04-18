@@ -123,9 +123,11 @@ class TrainArgs(SFTConfig):
     aux_query_token_offset: int = 0
     aux_num_last_queries: int = 32  # number of last query positions returned by attention kernel
     sft_loss_weight: float = 1.0
-    token_compression_mode: str = "none"  # none | topk | last | mid_last (used by eval_attn.py)
+    token_compression_mode: str = "none"  # none | topk | last | mid_last | segment (used by eval_attn.py)
     token_compression_topk: int = 8       # only used when token_compression_mode=topk
     token_compression_last_k: int = 1     # only used when token_compression_mode=last
+    token_compression_segment_k: int = 10  # only used when token_compression_mode=segment
+    token_compression_segment_anchor: str = "end"  # start | end, used when token_compression_mode=segment
     attention_weighted_top_k: Optional[int] = 1  # None => last-k only; k => last-k + attention-weighted top-k
     query_aggregation_mode: str = "single"  # single | mean_all | logsumexp_all
     use_doc_align_loss: bool = False      # align compressed doc representation to full-doc representation
@@ -290,6 +292,8 @@ def main():
             f"aux_num_last_queries={getattr(targs, 'aux_num_last_queries', 32)}, "
             f"token_compression_mode={targs.token_compression_mode}, "
             f"token_compression_last_k={getattr(targs, 'token_compression_last_k', 1)}, "
+            f"token_compression_segment_k={getattr(targs, 'token_compression_segment_k', 10)}, "
+            f"token_compression_segment_anchor={getattr(targs, 'token_compression_segment_anchor', 'end')}, "
             f"attention_weighted_top_k={getattr(targs, 'attention_weighted_top_k', 1)}, "
             f"query_aggregation_mode={getattr(targs, 'query_aggregation_mode', 'single')}, "
             f"use_doc_align_loss={getattr(targs, 'use_doc_align_loss', False)}, "

@@ -18,7 +18,7 @@ data:
   data_path: "data/icr-beir-evals/bm25-top100/trec_covid.jsonl"
   qrels_path: "data/icr-beir-evals/qrels/trec_covid.tsv"
   position_id_mode: "perm_invariant" # perm_invariant | sequential
-  query_in_instruction: false
+  query_in_instruction: true
   remove_doc_id: true  # true => remove explicit 'ID: ... | END ID: ...' wrappers from doc blocks
 
 eval:
@@ -29,10 +29,12 @@ eval:
   train_test_split: 1.0
   max_block_length: 384
   aux_layer_idx: 20
-  token_compression_mode: "last"  # none | topk | last
-  token_compression_last_k: 32     # only used when token_compression_mode=last
+  token_compression_mode: "segment"  # none | topk | last | mid_last | segment
+  token_compression_last_k: 16     # only used when token_compression_mode=last
+  token_compression_segment_k: 20  # only used when token_compression_mode=segment
+  token_compression_segment_anchor: "end"  # start | end, only used when token_compression_mode=segment
   attention_weighted_top_k: none     # null/none => last-k only; k => last-k + doc-last-token attention top-k
-  token_compression_topk: 1   # 仅在 token_compression_mode=topk 时生效
+  token_compression_topk: 1   # only used when token_compression_mode=topk
 
 # Full list of BEIR datasets available locally.
 # Comment out any entries you don't want to include in a multi-run loop.

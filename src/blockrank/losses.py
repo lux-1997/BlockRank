@@ -56,6 +56,26 @@ def _mid_last_valid_token_mask(mask: torch.Tensor) -> torch.Tensor:
     return valid & ((rank == mid_rank) | (rank == last_rank))
 
 
+def _segment_valid_token_mask(mask: torch.Tensor, segment_k: int = 10, anchor: str = "end") -> torch.Tensor:
+    """Keep one valid token every k positions, anchored from start or end."""
+    if segment_k <= 0:
+        raise ValueError(f"segment_k must be > 0, got {segment_k}")
+    anchor = anchor.lower()
+    if anchor not in ("start", "end"):
+        raise ValueError(f"anchor must be one of ['start', 'end'], got {anchor}")
+
+    valid = mask.bool()
+    rank = valid.cumsum(dim=-1) - 1
+    if anchor == "start":
+        keep = (rank.remainder(int(segment_k)) == 0)
+    else:
+        valid_count = valid.sum(dim=-1, keepdim=True)
+        dist_from_end = valid_count - 1 - rank
+        keep = (dist_from_end.remainder(int(segment_k)) == 0)
+
+    return valid & keep
+
+
 def _normalize_optional_top_k(value: int | str | None, field_name: str = "attention_weighted_top_k") -> int | None:
     """Normalize optional top-k config; accepts None/null/none."""
     if value is None:
@@ -75,6 +95,8 @@ def compress_attention_mask_to_doc_anchor_tokens(
     block_order: str = "instruction_first",
     token_compression_mode: str = "last",
     last_k: int = 1,
+    token_compression_segment_k: int = 10,
+    token_compression_segment_anchor: str = "end",
 ) -> torch.Tensor:
     """
     Keep only selected anchor tokens visible in each document block.
@@ -84,7 +106,7 @@ def compress_attention_mask_to_doc_anchor_tokens(
         return attention_mask
 
     mode = token_compression_mode.lower()
-    if mode not in ("none", "last", "mid_last"):
+    if mode not in ("none", "last", "mid_last", "segment"):
         raise ValueError(f"Unsupported token_compression_mode for forward compression: {token_compression_mode}")
     if mode == "none":
         return attention_mask
@@ -101,8 +123,14 @@ def compress_attention_mask_to_doc_anchor_tokens(
     doc_mask = attention_mask[:, doc_slice, :]
     if mode == "last":
         doc_visible_mask = _last_k_valid_token_mask(doc_mask, last_k=last_k)
-    else:
+    elif mode == "mid_last":
         doc_visible_mask = _mid_last_valid_token_mask(doc_mask)
+    else:
+        doc_visible_mask = _segment_valid_token_mask(
+            doc_mask,
+            segment_k=int(token_compression_segment_k),
+            anchor=token_compression_segment_anchor,
+        )
     compressed[:, doc_slice, :] = doc_visible_mask.to(attention_mask.dtype)
     return compressed
 
@@ -233,6 +261,8 @@ def compute_auxiliary_attention_loss(
     aux_norm_mode: str = "doc_plus_non_doc",
     token_compression_mode: str = "none",
     token_compression_last_k: int = 1,
+    token_compression_segment_k: int = 10,
+    token_compression_segment_anchor: str = "end",
     attention_weighted_top_k: int | None = 1,
     query_aggregation_mode: str = "single",
     query_token_mask: torch.Tensor | None = None,
@@ -301,11 +331,23 @@ def compute_auxiliary_attention_loss(
     if aux_norm_mode not in ("doc_plus_non_doc", "doc_only"):
         raise ValueError(f"Unknown aux_norm_mode: {aux_norm_mode}")
     mode = token_compression_mode.lower()
-    if mode not in ("none", "last", "mid_last", "topk"):
+    if mode not in ("none", "last", "mid_last", "topk", "segment"):
         raise ValueError(f"Unknown token_compression_mode: {token_compression_mode}")
     if int(token_compression_last_k) <= 0:
         raise ValueError(f"token_compression_last_k must be > 0, got {token_compression_last_k}")
+    if mode == "segment":
+        if int(token_compression_segment_k) <= 0:
+            raise ValueError(
+                f"token_compression_segment_k must be > 0, got {token_compression_segment_k}"
+            )
+        if str(token_compression_segment_anchor).lower() not in ("start", "end"):
+            raise ValueError(
+                "token_compression_segment_anchor must be one of ['start', 'end'], "
+                f"got {token_compression_segment_anchor}"
+            )
     aw_top_k = _normalize_optional_top_k(attention_weighted_top_k, field_name="attention_weighted_top_k")
+    if mode == "segment":
+        aw_top_k = None
 
     effective_aux_norm_mode = aux_norm_mode
     if (aw_top_k is not None or mode in ("last", "mid_last")) and aux_norm_mode == "doc_plus_non_doc":
@@ -323,15 +365,22 @@ def compute_auxiliary_attention_loss(
     doc_token_mask = attention_mask[:, doc_block_start:doc_block_end, :].bool()  # (B, num_docs, H)
     doc_logits = bracket_attn_logits[..., doc_start:doc_end]
 
-    last_k_mask = _last_k_valid_token_mask(doc_token_mask, last_k=int(token_compression_last_k))
-    if aw_top_k is None:
-        # None => use last-k only
-        doc_select_mask = last_k_mask
+    if mode == "segment":
+        doc_select_mask = _segment_valid_token_mask(
+            doc_token_mask,
+            segment_k=int(token_compression_segment_k),
+            anchor=token_compression_segment_anchor,
+        )
     else:
-        # k => use union(last-k, attention-weighted top-k visible from forward mask)
-        visible_threshold = torch.finfo(doc_logits.dtype).min / 2
-        visible_mask = (doc_logits[:, 0, 0] > visible_threshold).reshape(B, num_docs, H)
-        doc_select_mask = last_k_mask | (visible_mask & doc_token_mask)
+        last_k_mask = _last_k_valid_token_mask(doc_token_mask, last_k=int(token_compression_last_k))
+        if aw_top_k is None:
+            # None => use last-k only
+            doc_select_mask = last_k_mask
+        else:
+            # k => use union(last-k, attention-weighted top-k visible from forward mask)
+            visible_threshold = torch.finfo(doc_logits.dtype).min / 2
+            visible_mask = (doc_logits[:, 0, 0] > visible_threshold).reshape(B, num_docs, H)
+            doc_select_mask = last_k_mask | (visible_mask & doc_token_mask)
 
     doc_logits = doc_logits.masked_fill(
         ~doc_select_mask.reshape(B, 1, 1, num_docs * H),
@@ -407,6 +456,8 @@ def compute_auxiliary_attention_loss_copynet(
     aux_norm_mode: str = "doc_plus_non_doc",
     token_compression_mode: str = "none",
     token_compression_last_k: int = 1,
+    token_compression_segment_k: int = 10,
+    token_compression_segment_anchor: str = "end",
     attention_weighted_top_k: int | None = 1,
     query_aggregation_mode: str = "single",
     query_token_mask: torch.Tensor | None = None,
@@ -473,11 +524,23 @@ def compute_auxiliary_attention_loss_copynet(
     if aux_norm_mode not in ("doc_plus_non_doc", "doc_only"):
         raise ValueError(f"Unknown aux_norm_mode: {aux_norm_mode}")
     mode = token_compression_mode.lower()
-    if mode not in ("none", "last", "mid_last", "topk"):
+    if mode not in ("none", "last", "mid_last", "topk", "segment"):
         raise ValueError(f"Unknown token_compression_mode: {token_compression_mode}")
     if int(token_compression_last_k) <= 0:
         raise ValueError(f"token_compression_last_k must be > 0, got {token_compression_last_k}")
+    if mode == "segment":
+        if int(token_compression_segment_k) <= 0:
+            raise ValueError(
+                f"token_compression_segment_k must be > 0, got {token_compression_segment_k}"
+            )
+        if str(token_compression_segment_anchor).lower() not in ("start", "end"):
+            raise ValueError(
+                "token_compression_segment_anchor must be one of ['start', 'end'], "
+                f"got {token_compression_segment_anchor}"
+            )
     aw_top_k = _normalize_optional_top_k(attention_weighted_top_k, field_name="attention_weighted_top_k")
+    if mode == "segment":
+        aw_top_k = None
 
     effective_aux_norm_mode = aux_norm_mode
     if (aw_top_k is not None or mode in ("last", "mid_last")) and aux_norm_mode == "doc_plus_non_doc":
@@ -504,15 +567,22 @@ def compute_auxiliary_attention_loss_copynet(
     doc_token_mask = attention_mask[:, doc_block_start:doc_block_end, :].bool()
     doc_logits = bracket_attn_logits[..., doc_start:doc_end]
 
-    last_k_mask = _last_k_valid_token_mask(doc_token_mask, last_k=int(token_compression_last_k))
-    if aw_top_k is None:
-        # None => use last-k only
-        doc_select_mask = last_k_mask
+    if mode == "segment":
+        doc_select_mask = _segment_valid_token_mask(
+            doc_token_mask,
+            segment_k=int(token_compression_segment_k),
+            anchor=token_compression_segment_anchor,
+        )
     else:
-        # k => use union(last-k, attention-weighted top-k visible from forward mask)
-        visible_threshold = torch.finfo(doc_logits.dtype).min / 2
-        visible_mask = (doc_logits[:, 0, 0] > visible_threshold).reshape(B, num_docs, H)
-        doc_select_mask = last_k_mask | (visible_mask & doc_token_mask)
+        last_k_mask = _last_k_valid_token_mask(doc_token_mask, last_k=int(token_compression_last_k))
+        if aw_top_k is None:
+            # None => use last-k only
+            doc_select_mask = last_k_mask
+        else:
+            # k => use union(last-k, attention-weighted top-k visible from forward mask)
+            visible_threshold = torch.finfo(doc_logits.dtype).min / 2
+            visible_mask = (doc_logits[:, 0, 0] > visible_threshold).reshape(B, num_docs, H)
+            doc_select_mask = last_k_mask | (visible_mask & doc_token_mask)
 
     doc_logits = doc_logits.masked_fill(
         ~doc_select_mask.reshape(B, 1, 1, num_docs * H),

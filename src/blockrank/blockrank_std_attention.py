@@ -165,8 +165,10 @@ def _select_doc_anchor_tokens_from_additive_mask(
     doc_mask_row: torch.Tensor,
     token_compression_mode: str,
     token_compression_last_k: int,
+    token_compression_segment_k: int = 10,
+    token_compression_segment_anchor: str = "end",
 ) -> torch.Tensor:
-    """Select anchor tokens (last-k or mid+last) from per-doc additive mask rows."""
+    """Select anchor tokens (last-k / mid+last / segment-wise) from per-doc additive mask rows."""
     mode = token_compression_mode.lower()
     valid = _additive_mask_valid_tokens(doc_mask_row)
 
@@ -191,6 +193,27 @@ def _select_doc_anchor_tokens_from_additive_mask(
         mid_rank = (valid_count + 1) // 2
         last_rank = valid_count
         return valid & ((rank == mid_rank) | (rank == last_rank))
+
+    if mode == "segment":
+        if token_compression_segment_k <= 0:
+            raise ValueError(
+                "token_compression_segment_k must be > 0 when token_compression_mode='segment', "
+                f"got {token_compression_segment_k}"
+            )
+        anchor = token_compression_segment_anchor.lower()
+        if anchor not in ("start", "end"):
+            raise ValueError(
+                "token_compression_segment_anchor must be one of ['start', 'end'] when "
+                f"token_compression_mode='segment', got {token_compression_segment_anchor}"
+            )
+        rank = valid.cumsum(dim=-1) - 1
+        if anchor == "start":
+            keep = (rank.remainder(int(token_compression_segment_k)) == 0)
+        else:
+            valid_count = valid.sum(dim=-1, keepdim=True)
+            dist_from_end = valid_count - 1 - rank
+            keep = (dist_from_end.remainder(int(token_compression_segment_k)) == 0)
+        return valid & keep
 
     return valid
 
@@ -289,6 +312,8 @@ def _compress_query_doc_visibility_mask(
     block_order: str,
     token_compression_mode: str,
     token_compression_last_k: int,
+    token_compression_segment_k: int = 10,
+    token_compression_segment_anchor: str = "end",
     attention_weighted_top_k: Optional[int | str] = 1,
     query_blocks: Optional[torch.Tensor] = None,
     key_blocks: Optional[torch.Tensor] = None,
@@ -296,9 +321,12 @@ def _compress_query_doc_visibility_mask(
 ) -> torch.Tensor:
     """Compress doc-token visibility only for the last query block attending to docs."""
     mode = (token_compression_mode or "none").lower()
-    if mode not in ("none", "topk", "last", "mid_last"):
+    if mode not in ("none", "topk", "last", "mid_last", "segment"):
         raise ValueError(f"Unknown token_compression_mode: {token_compression_mode}")
     aw_top_k = _normalize_attention_weighted_top_k(attention_weighted_top_k)
+    if mode == "segment":
+        # Strict segment-wise selection: do not union with attention-weighted top-k.
+        aw_top_k = None
 
     _, _, prev_blocks, _ = mask_others_blocks.shape
     if block_order == "instruction_first":
@@ -313,13 +341,24 @@ def _compress_query_doc_visibility_mask(
     if doc_rows.numel() == 0:
         return out
 
-    # Default keep-set is last-k (or mid+last for legacy mode).
-    default_mode = "mid_last" if mode == "mid_last" else "last"
-    doc_keep = _select_doc_anchor_tokens_from_additive_mask(
-        doc_mask_row=doc_rows,
-        token_compression_mode=default_mode,
-        token_compression_last_k=int(token_compression_last_k),
-    )
+    if mode == "segment":
+        doc_keep = _select_doc_anchor_tokens_from_additive_mask(
+            doc_mask_row=doc_rows,
+            token_compression_mode="segment",
+            token_compression_last_k=int(token_compression_last_k),
+            token_compression_segment_k=int(token_compression_segment_k),
+            token_compression_segment_anchor=token_compression_segment_anchor,
+        )
+    else:
+        # Default keep-set is last-k (or mid+last for legacy mode).
+        default_mode = "mid_last" if mode == "mid_last" else "last"
+        doc_keep = _select_doc_anchor_tokens_from_additive_mask(
+            doc_mask_row=doc_rows,
+            token_compression_mode=default_mode,
+            token_compression_last_k=int(token_compression_last_k),
+            token_compression_segment_k=int(token_compression_segment_k),
+            token_compression_segment_anchor=token_compression_segment_anchor,
+        )
 
     if aw_top_k is not None:
         if query_blocks is None or key_blocks is None or full_attention_mask is None:
@@ -496,6 +535,11 @@ def eager_blockrank_attention_forward(
     if token_compression_last_k is None:
         token_compression_last_k = 1
     token_compression_last_k = int(token_compression_last_k)
+    token_compression_segment_k = kwargs.get("token_compression_segment_k", 10)
+    if token_compression_segment_k is None:
+        token_compression_segment_k = 10
+    token_compression_segment_k = int(token_compression_segment_k)
+    token_compression_segment_anchor = kwargs.get("token_compression_segment_anchor", "end")
     attention_weighted_top_k = kwargs.get("attention_weighted_top_k", 1)
     mask_others = attention_mask[:, :, :M-1, -1, :]              # (B, 1, M-1, H)
     mask_others = _compress_query_doc_visibility_mask(
@@ -503,6 +547,8 @@ def eager_blockrank_attention_forward(
         block_order=block_order,
         token_compression_mode=token_compression_mode,
         token_compression_last_k=token_compression_last_k,
+        token_compression_segment_k=token_compression_segment_k,
+        token_compression_segment_anchor=token_compression_segment_anchor,
         attention_weighted_top_k=attention_weighted_top_k,
         query_blocks=Q,
         key_blocks=K,
@@ -928,6 +974,11 @@ def sdpa_blockrank_attention_forward(
     if token_compression_last_k is None:
         token_compression_last_k = 1
     token_compression_last_k = int(token_compression_last_k)
+    token_compression_segment_k = kwargs.get("token_compression_segment_k", 10)
+    if token_compression_segment_k is None:
+        token_compression_segment_k = 10
+    token_compression_segment_k = int(token_compression_segment_k)
+    token_compression_segment_anchor = kwargs.get("token_compression_segment_anchor", "end")
     attention_weighted_top_k = kwargs.get("attention_weighted_top_k", 1)
     mask_others = attention_mask[:, :, :M-1, -1, :]              # (B, 1, M-1, H)
     mask_others = _compress_query_doc_visibility_mask(
@@ -935,6 +986,8 @@ def sdpa_blockrank_attention_forward(
         block_order=block_order,
         token_compression_mode=token_compression_mode,
         token_compression_last_k=token_compression_last_k,
+        token_compression_segment_k=token_compression_segment_k,
+        token_compression_segment_anchor=token_compression_segment_anchor,
         attention_weighted_top_k=attention_weighted_top_k,
         query_blocks=Q,
         key_blocks=K,
