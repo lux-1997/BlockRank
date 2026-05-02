@@ -66,7 +66,15 @@ def load_icr_dataset_hf(
             ds_dict = raw.train_test_split(test_size=1 - train_test_split, seed=seed or 42)
 
     PROMPT_SEGMENT_SEP = "<<end_of_block_prompt_segment>>" if use_blockrank else "\n"
-    PROMPT_TYPE = prompt_type or ("mistral" if "mistral" in tokenizer.name_or_path.lower() else "qwen")
+    tokenizer_name = tokenizer.name_or_path.lower()
+    if prompt_type:
+        PROMPT_TYPE = prompt_type
+    elif "mistral" in tokenizer_name:
+        PROMPT_TYPE = "mistral"
+    elif "qwen2.5" in tokenizer_name or "qwen2-5" in tokenizer_name:
+        PROMPT_TYPE = "qwen2_5"
+    else:
+        PROMPT_TYPE = "qwen"
     print(f"[load_icr_dataset_hf] Using PROMPT_TYPE={PROMPT_TYPE}")
     resolved_doc_end_token = doc_end_token
     if isinstance(doc_end_token, str):

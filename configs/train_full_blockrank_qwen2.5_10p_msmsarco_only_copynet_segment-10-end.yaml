@@ -1,13 +1,13 @@
-# Configuration for large-scale training on full dataset
+# Configuration for large-scale training on full dataset (segment-wise token compression)
 
 model:
-  model_name_or_path: "/data/xuanlu/.cache/huggingface/Mistral-7B-Instruct-v0.3"
+  model_name_or_path: "/data/xuanlu/.cache/huggingface/Qwen2.5-7B-Instruct"
   use_4bit: false
   use_lora: false
   trust_remote_code: false
   use_blockrank: true
-  attn_implementation: "default_blockrank" 
-  block_order: "doc_first"
+  attn_implementation: "eager_blockrank"
+  block_order: "instruction_first"
 
 data:
   data_path: "data/train/parsed_hard_ids_10p_train.jsonl"  # Full dataset
@@ -18,11 +18,12 @@ data:
   max_seq_length: 6144
   dataset_seed: 42
   max_block_length: 160
+  position_id_mode: "perm_invariant"
   query_in_instruction: false
-  remove_doc_id: true
+  remove_doc_id: true  # true => remove explicit 'ID: ... | END ID: ...' wrappers from doc blocks
 
 training:
-  output_dir: "outputs/blockrank-10p-msmarco-mistral-7b-only-copynet-doc-first"
+  output_dir: "outputs/blockrank-10p-msmarco-qwen2.5-7b-only-copynet-no-prefix-query-segment-10-end"
   num_train_epochs: 1
   per_device_train_batch_size: 1
   per_device_eval_batch_size: 1
@@ -42,18 +43,25 @@ training:
   use_liger_kernel: false
   seed: 42
   report_to: "wandb"
-  run_name: "blockrank-10p-msmarco-mistral-7b"
+  run_name: "blockrank-10p-msmarco-qwen2.5-7b"
   do_eval: true
   evaluation_strategy: "steps"
   load_best_model_at_end: false
   metric_for_best_model: "eval_loss"
   use_aux_loss: true        # Enable auxiliary attention loss
-  aux_layer_idx: 20         # Layer to extract attention scores (l* in paper)
+  aux_layer_idx: 24         # Layer to extract attention scores (l* in paper)
   aux_loss_weight: 0.5      # Lambda in paper (default: 0.1)
   aux_temperature: 0.05
   aux_query_token_offset: 0  # In BlockRank split/merge pipeline, supervised completion starts at '['
-  aux_norm_mode: "doc_only"  # Avoid non-doc normalization collapse in last-token training
-  sft_loss_weight: 0.0 
-  aux_loss_type: "copynet"      # Tau in InfoNCE loss (default: 0.1)
-  token_compression_mode: "none"  # none: see all doc tokens; last: only each doc's last token
-  token_compression_last_k: 16    # used when token_compression_mode=last; set 4 => last 4 doc tokens
+  query_aggregation_mode: "single" # single / mean_all, logsumexp_all
+  aux_num_last_queries: 32
+  # aux_norm_mode: "doc_only"
+  sft_loss_weight: 0.0
+  aux_loss_type: "copynet"
+  token_compression_mode: "segment"  # segment-wise keep 1 token per k, per doc
+  token_compression_segment_k: 10
+  token_compression_segment_anchor: "end"
+  attention_weighted_top_k: none      # segment mode is strict; no top-k union
+
+  use_doc_align_loss: false
+  doc_align_loss_weight: 0.05

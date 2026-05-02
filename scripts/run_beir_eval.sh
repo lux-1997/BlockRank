@@ -14,7 +14,7 @@ set -euo pipefail
 
 CONFIG=${1:-configs/eval_mistral_beir.yaml}
 if [ $# -gt 0 ]; then shift; fi
-CKPT=${1:-/data/mengrui/test_lx/OLM2Vec/BlockRank/outputs/blockrank-10p-msmarco-mistral-7b-only-copynet-segment-20-end}
+CKPT=${1:-/data/xuanlu/BlockRank/outputs/blockrank-10p-msmarco-qwen3-8b-only-copynet-no-prefix-query-segment-10-end}
 if [ $# -gt 0 ]; then shift; fi
 
 # Disable W&B network/login; override by exporting WANDB_DISABLED=false or WANDB_MODE=online if you really want logging.
@@ -37,6 +37,25 @@ requested = set(sys.argv[3:])
 
 with open(cfg_path, "r") as f:
     cfg = yaml.safe_load(f) or {}
+
+retrieval_cfg = cfg.get("retrieval", {}) or {}
+bm25_top_k = int(os.environ.get("BEIR_BM25_TOP_K", retrieval_cfg.get("bm25_top_k", cfg.get("bm25_top_k", 100))))
+if bm25_top_k not in {30, 50, 100, 200, 300, 400, 500}:
+    raise SystemExit(
+        f"Unsupported bm25_top_k={bm25_top_k}; expected one of 30, 50, 100, 200, 300, 400, 500."
+    )
+
+def resolve_templates(value):
+    if isinstance(value, str):
+        return value.format(bm25_top_k=bm25_top_k)
+    if isinstance(value, dict):
+        return {k: resolve_templates(v) for k, v in value.items()}
+    if isinstance(value, list):
+        return [resolve_templates(v) for v in value]
+    return value
+
+cfg = resolve_templates(cfg)
+cfg.setdefault("retrieval", {})["bm25_top_k"] = bm25_top_k
 
 datasets = cfg.get("datasets", [])
 if not datasets:

@@ -1,7 +1,7 @@
 # Configuration for large-scale training on full dataset
 
 model:
-  model_name_or_path: "/code/.cache/huggingface/Mistral-7B-Instruct-v0.3"
+  model_name_or_path: "/data/xuanlu/.cache/huggingface/Mistral-7B-Instruct-v0.3"
   use_4bit: false
   use_lora: false
   trust_remote_code: false

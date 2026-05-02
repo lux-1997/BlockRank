@@ -1,7 +1,7 @@
 # Configuration for large-scale training on full dataset (segment-wise token compression)
 
 model:
-  model_name_or_path: ".cache/huggingface/Mistral-7B-Instruct-v0.3"
+  model_name_or_path: "/data/xuanlu/.cache/huggingface/Mistral-7B-Instruct-v0.3"
   use_4bit: false
   use_lora: false
   trust_remote_code: false
@@ -17,7 +17,7 @@ data:
   max_seq_length: 6144
   dataset_seed: 42
   max_block_length: 160
-  query_in_instruction: true
+  query_in_instruction: false
   remove_doc_id: true  # true => remove explicit 'ID: ... | END ID: ...' wrappers from doc blocks
 
 training:

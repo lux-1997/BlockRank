@@ -257,6 +257,32 @@ def create_conversation_format_mistral(
         {"role": "assistant", "content": f"Final Answer: {sep}[" + (', '.join([str(x) for x in answer_ids]) + f"]" if answer_ids else "")}
     ]
 
+def create_conversation_format_qwen25(
+    query: str,
+    documents: Dict[str, str],
+    answer_ids: List[str],
+    sep="\n",
+    block_order: str = "instruction_first",
+    query_in_instruction: bool = True,
+    doc_end_token: str | None = None,
+    remove_doc_id: bool = False,
+) -> List[Dict[str, str]]:
+    return [
+        {
+            "role": "user",
+            "content": format_ranking_prompt_mistral(
+                query,
+                documents,
+                sep,
+                block_order,
+                query_in_instruction,
+                doc_end_token=doc_end_token,
+                remove_doc_id=remove_doc_id,
+            ),
+        },
+        {"role": "assistant", "content": f"Final Answer: {sep}[" + (', '.join([str(x) for x in answer_ids]) + f"]" if answer_ids else "")}
+    ]
+
 def create_conversation_format_qwen(
     query: str,
     documents: Dict[str, str],
@@ -299,7 +325,7 @@ def create_prompt_completion_format(
     documents: Dict[str, str],
     answer_ids: List[str],
     sep="\n",
-    type: str = "mistral", # mistral or qwen
+    type: str = "mistral", # mistral, qwen2_5, or qwen
     block_order: str = "instruction_first",
     query_in_instruction: bool = True,
     doc_end_token: str | None = None,
@@ -317,6 +343,19 @@ def create_prompt_completion_format(
             remove_doc_id=remove_doc_id,
         )
         return {"prompt": m[:1], "completion": m[1:]}
+    elif type in ("qwen2_5", "qwen25", "qwen2.5"):
+        m = create_conversation_format_qwen25(
+            query,
+            documents,
+            answer_ids,
+            sep,
+            block_order,
+            query_in_instruction,
+            doc_end_token=doc_end_token,
+            remove_doc_id=remove_doc_id,
+        )
+        # Keep Qwen chat-template wrapping, but use a non-thinking answer prefix.
+        return {"prompt": m[:-1], "completion": m[-1:]}
     elif type == "qwen":
         m = create_conversation_format_qwen(
             query,

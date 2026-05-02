@@ -50,6 +50,30 @@ def _resolve_blockrank_flags(module: nn.Module, kwargs):
         doc_cross_attn = _DOC_CROSS_ATTN_DEFAULT
     return block_order, bool(doc_cross_attn)
 
+
+def _normalize_return_last_block_attn_scores(module: nn.Module, kwargs):
+    """
+    Resolve layer-specific attention-score requests outside compiled regions.
+
+    `layers_to_return_scores` depends on `module.layer_idx`, which would force
+    `torch.compile` to specialize per decoder layer. That interacts poorly with
+    gradient checkpointing because the recomputation path may hit a different
+    compiled/eager variant than the original forward. Normalize it once here and
+    pass only the resulting boolean into the compiled kernel.
+    """
+    normalized = dict(kwargs)
+    layers_to_return_scores = normalized.pop("layers_to_return_scores", None)
+    if layers_to_return_scores is not None:
+        layer_idx = getattr(module, "layer_idx", None)
+        normalized["return_last_block_attn_scores"] = bool(
+            layer_idx is not None and layer_idx in layers_to_return_scores
+        )
+    else:
+        normalized["return_last_block_attn_scores"] = bool(
+            normalized.get("return_last_block_attn_scores", False)
+        )
+    return normalized
+
 def _resolve_blockrank_mask_flags(kwargs):
     block_order = None
     doc_cross_attn = None
@@ -378,7 +402,7 @@ def _compress_query_doc_visibility_mask(
     out[:, :, doc_slice, :] = torch.where(doc_keep, doc_rows, torch.full_like(doc_rows, masked_value))
     return out
 
-def eager_blockrank_attention_forward(
+def _eager_blockrank_attention_forward_impl(
     module: nn.Module,
     query: torch.Tensor,
     key: torch.Tensor,
@@ -571,20 +595,7 @@ def eager_blockrank_attention_forward(
     # Reshape output to expected format
     out = out.view(B, N, MH, D).transpose(1, 2).contiguous()  # (B, M*H, N, D)
 
-    # Check if we need to return attention scores
-    # Support layer-specific configuration
-    layers_to_return_scores = kwargs.get('layers_to_return_scores', None)
-    if layers_to_return_scores is not None:
-        # If specific layers are specified, only return scores for those layers
-        layer_idx = getattr(module, 'layer_idx', None)
-        if layer_idx is not None and layer_idx in layers_to_return_scores:
-            return_last_block_attn_scores = True
-        else:
-            return_last_block_attn_scores = False
-    else:
-        # Default behavior: use the parameter directly
-        return_last_block_attn_scores = kwargs.get('return_last_block_attn_scores', False)
-
+    return_last_block_attn_scores = bool(kwargs.get('return_last_block_attn_scores', False))
     num_last_queries = kwargs.get('num_last_queries', 16)
 
     if return_last_block_attn_scores:
@@ -593,10 +604,34 @@ def eager_blockrank_attention_forward(
         s_last = None
     return out, s_last
 
+
+def eager_blockrank_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs: Unpack[TransformersKwargs],
+):
+    kwargs = _normalize_return_last_block_attn_scores(module, kwargs)
+    return _eager_blockrank_attention_forward_impl(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        scaling,
+        dropout=dropout,
+        **kwargs,
+    )
+
 def eager_blockrank_attention_mask(
     batch_size: int,
-    cache_position: torch.Tensor,
+    q_length: int,
     kv_length: int,
+    q_offset: int = 0,
     kv_offset: int = 0,
     mask_function: Callable = None,
     attention_mask: Optional[torch.Tensor] = None,
@@ -611,8 +646,9 @@ def eager_blockrank_attention_mask(
 
     Args:
         batch_size: Batch size
-        cache_position: Cache position tensor (not used, for interface compatibility)
+        q_length: Query length (not used, for interface compatibility)
         kv_length: Key-value length (not used, for interface compatibility)
+        q_offset: Query offset (not used, for interface compatibility)
         kv_offset: KV offset (not used, for interface compatibility)
         mask_function: Mask function (not used, for interface compatibility)
         attention_mask: (B, M, H) Binary mask where 1=valid, 0=padding
@@ -642,8 +678,9 @@ def eager_blockrank_attention_mask(
 
 def flex_blockrank_attention_mask(
     batch_size: int,
-    cache_position: torch.Tensor,
+    q_length: int,
     kv_length: int,
+    q_offset: int = 0,
     kv_offset: int = 0,
     mask_function: Optional[torch.Tensor] = None,
     attention_mask: Optional[torch.Tensor] = None,
@@ -808,7 +845,7 @@ def flex_blockrank_attention_forward(
     
     return attn_output, None  # flex_attention doesn't return attention weights
 
-def sdpa_blockrank_attention_forward(
+def _sdpa_blockrank_attention_forward_impl(
     module: nn.Module,
     query: torch.Tensor,
     key: torch.Tensor,
@@ -1008,20 +1045,7 @@ def sdpa_blockrank_attention_forward(
         scale=scaling,
     )
     
-    # Check if we need to return attention scores
-    # Support layer-specific configuration
-    layers_to_return_scores = kwargs.get('layers_to_return_scores', None)
-    if layers_to_return_scores is not None:
-        # If specific layers are specified, only return scores for those layers
-        layer_idx = getattr(module, 'layer_idx', None)
-        if layer_idx is not None and layer_idx in layers_to_return_scores:
-            return_last_block_attn_scores = True
-        else:
-            return_last_block_attn_scores = False
-    else:
-        # Default behavior: use the parameter directly
-        return_last_block_attn_scores = kwargs.get('return_last_block_attn_scores', False)
-
+    return_last_block_attn_scores = bool(kwargs.get('return_last_block_attn_scores', False))
     num_last_queries = kwargs.get('num_last_queries', 16)
 
     s_last = None
@@ -1037,10 +1061,117 @@ def sdpa_blockrank_attention_forward(
 
     return out, s_last  # Return last block's attention weights
 
+
+def sdpa_blockrank_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs: Unpack[TransformersKwargs],
+):
+    kwargs = _normalize_return_last_block_attn_scores(module, kwargs)
+    return _sdpa_blockrank_attention_forward_impl(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        scaling,
+        dropout=dropout,
+        **kwargs,
+    )
+
+
+_default_compiled_blockrank_attention_forward = torch.compile(
+    _eager_blockrank_attention_forward_impl,
+    mode="default",
+)
+_max_autotune_compiled_blockrank_attention_forward = torch.compile(
+    _eager_blockrank_attention_forward_impl,
+    mode="max-autotune",
+)
+_sdpa_compiled_blockrank_attention_forward = torch.compile(
+    _sdpa_blockrank_attention_forward_impl,
+)
+
+
+def default_blockrank_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs: Unpack[TransformersKwargs],
+):
+    kwargs = _normalize_return_last_block_attn_scores(module, kwargs)
+    return _default_compiled_blockrank_attention_forward(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        scaling,
+        dropout=dropout,
+        **kwargs,
+    )
+
+
+def max_autotune_blockrank_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs: Unpack[TransformersKwargs],
+):
+    kwargs = _normalize_return_last_block_attn_scores(module, kwargs)
+    return _max_autotune_compiled_blockrank_attention_forward(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        scaling,
+        dropout=dropout,
+        **kwargs,
+    )
+
+
+def sdpa_compiled_blockrank_attention_forward(
+    module: nn.Module,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attention_mask: Optional[torch.Tensor],
+    scaling: float,
+    dropout: float = 0.0,
+    **kwargs: Unpack[TransformersKwargs],
+):
+    kwargs = _normalize_return_last_block_attn_scores(module, kwargs)
+    return _sdpa_compiled_blockrank_attention_forward(
+        module,
+        query,
+        key,
+        value,
+        attention_mask,
+        scaling,
+        dropout=dropout,
+        **kwargs,
+    )
+
 def register_blockrank_attention():
     # Register the BlockRank attention implementation with Transformers
-    for mode in ["default", "max-autotune", 'eager']:
-        AttentionInterface.register(f"{mode}_blockrank", torch.compile(eager_blockrank_attention_forward, mode=mode) if mode != 'eager' else eager_blockrank_attention_forward)
+    AttentionInterface.register("eager_blockrank", eager_blockrank_attention_forward)
+    AttentionInterface.register("default_blockrank", default_blockrank_attention_forward)
+    AttentionInterface.register("max-autotune_blockrank", max_autotune_blockrank_attention_forward)
+    for mode in ["default", "max-autotune", "eager"]:
         AttentionMaskInterface.register(f"{mode}_blockrank", eager_blockrank_attention_mask)
     
     AttentionInterface.register(f"flex_blockrank", torch.compile(flex_blockrank_attention_forward))
@@ -1049,5 +1180,5 @@ def register_blockrank_attention():
     AttentionInterface.register(f"sdpa_blockrank", sdpa_blockrank_attention_forward)
     AttentionMaskInterface.register(f"sdpa_blockrank", eager_blockrank_attention_mask)
 
-    AttentionInterface.register(f"sdpa_compiled_blockrank", torch.compile(sdpa_blockrank_attention_forward))
+    AttentionInterface.register(f"sdpa_compiled_blockrank", sdpa_compiled_blockrank_attention_forward)
     AttentionMaskInterface.register(f"sdpa_compiled_blockrank", eager_blockrank_attention_mask)
